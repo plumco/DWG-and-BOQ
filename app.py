@@ -1,415 +1,127 @@
 """
-Huliot Drawing Marker + BOQ Generator
-1. Detect bathrooms in DXF
-2. ADD SH labels to drawing
-3. Generate BOQ Excel
+Huliot BOQ Generator - SIMPLE VERSION
+Detect SH marks in drawing → Count fixtures → Generate BOQ
 """
 
 import streamlit as st
 import pandas as pd
 import ezdxf
-import io
-import base64
-from pathlib import Path
-from collections import defaultdict, Counter
+import os
+import tempfile
 import re
 import math
-import tempfile
-import os
 
-st.set_page_config(page_title="Huliot Auto SH Marker + BOQ", layout="wide")
+st.set_page_config(page_title="Huliot BOQ Generator", layout="wide")
 
 # CSS
 st.markdown("""
 <style>
-.big-font {font-size:24px !important; font-weight:bold; color:#1a5f3c;}
-.metric-green {background:#1a5f3c; color:white; padding:20px; border-radius:10px; text-align:center;}
-.step-box {background:#f0f8f4; border-left:5px solid #1a5f3c; padding:15px; margin:10px 0;}
+.main-title {font-size:2.5rem; font-weight:700; color:#1a5f3c; margin-bottom:0.5rem;}
+.subtitle {font-size:1.1rem; color:#666; margin-bottom:2rem;}
+.success-box {background:#d4edda; border:1px solid #c3e6cb; color:#155724; padding:1rem; border-radius:4px; margin:1rem 0;}
+.info-box {background:#e7f3ff; border:1px solid #b3d9ff; color:#004085; padding:1rem; border-radius:4px; margin:1rem 0;}
+.metric-card {background:#1a5f3c; color:white; padding:1.5rem; border-radius:10px; text-align:center; margin:0.5rem;}
 </style>
 """, unsafe_allow_html=True)
 
-st.markdown('<p class="big-font">🚿 Huliot Drawing Marker + BOQ Generator</p>', unsafe_allow_html=True)
-st.markdown("**Upload DXF → AI marks bathrooms with SH → Download marked DXF + BOQ Excel**")
+st.markdown('<h1 class="main-title">🚿 Huliot BOQ Generator</h1>', unsafe_allow_html=True)
+st.markdown('<p class="subtitle">Mark SH in AutoCAD → Upload DXF → Get BOQ</p>', unsafe_allow_html=True)
 
-# Session state
-if 'bathrooms' not in st.session_state:
-    st.session_state.bathrooms = []
-if 'marked_dxf_path' not in st.session_state:
-    st.session_state.marked_dxf_path = None
-
-def detect_bathrooms_spatial_clustering(dxf_path, grid_size=5000):
-    """Detect bathrooms by clustering WC blocks spatially"""
-    try:
-        # Check if file exists and has content
-        if not os.path.exists(dxf_path):
-            st.error(f"❌ File not found: {dxf_path}")
-            return []
-        
-        file_size = os.path.getsize(dxf_path)
-        if file_size < 100:
-            st.error("❌ File too small - invalid DXF")
-            return []
-        
-        # Try to read DXF
-        doc = ezdxf.readfile(dxf_path)
-        msp = doc.modelspace()
-    except Exception as e:
-        error_msg = str(e)
-        st.error(f"❌ Cannot read DXF file")
-        st.warning("**Fix this:**\n1. Open file in AutoCAD\n2. File > Save As > AutoCAD 2018 DXF\n3. Upload DXF (not DWG)")
-        st.info(f"Error detail: {error_msg[:100]}")
-        return []
-    
-    # Find all blocks
-    wc_blocks = []
-    basin_blocks = []
-    drain_blocks = []
-    
-    try:
-        for entity in msp.query('INSERT'):
-            name = entity.dxf.name.lower()
-            pos = (entity.dxf.insert.x, entity.dxf.insert.y)
-            
-            if re.search(r'(wc|toilet|closet|ewc)', name):
-                wc_blocks.append(pos)
-            elif re.search(r'(basin|sink|wash|lav)', name):
-                basin_blocks.append(pos)
-            elif re.search(r'(drain|fd|gully)', name):
-                drain_blocks.append(pos)
-    except Exception as e:
-        st.warning(f"Could not parse blocks: {str(e)[:50]}")
-    
-    if not wc_blocks:
-        return []
-    
-    # Cluster by proximity - group fixtures within grid_size distance
-    bathrooms = []
-    used_wcs = set()
-    
-    for i, wc_pos in enumerate(wc_blocks):
-        if i in used_wcs:
-            continue
-            
-        # Find nearby fixtures
-        nearby_basins = sum(1 for b in basin_blocks if distance(wc_pos, b) < grid_size)
-        nearby_drains = sum(1 for d in drain_blocks if distance(wc_pos, d) < grid_size)
-        nearby_wcs = sum(1 for j, w in enumerate(wc_blocks) if j != i and distance(wc_pos, w) < grid_size)
-        
-        bathroom = {
-            'center': wc_pos,
-            'fixtures': {
-                'WC': 1 + nearby_wcs,
-                'Wash Basin': nearby_basins,
-                'Floor Drain': nearby_drains
-            }
-        }
-        
-        bathrooms.append(bathroom)
-        used_wcs.add(i)
-    
-    return bathrooms
+# Initialize session state
+if 'sh_marks' not in st.session_state:
+    st.session_state.sh_marks = []
+if 'boq_data' not in st.session_state:
+    st.session_state.boq_data = None
 
 def distance(p1, p2):
-    """Euclidean distance"""
+    """Calculate distance between two points"""
     return math.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2)
 
-def convert_dwg_to_dxf_advanced(dwg_path):
-    """
-    Advanced DWG to DXF conversion with multiple fallback methods
-    """
-    dxf_path = dwg_path.replace('.dwg', '_converted.dxf').replace('.DWG', '_converted.dxf')
-    
-    # Method 1: ezdxf native read (DWG 2000-2018)
-    try:
-        doc = ezdxf.readfile(dwg_path)
-        doc.saveas(dxf_path)
-        return dxf_path
-    except Exception as e1:
-        pass
-    
-    # Method 2: Try system dwg2dxf (LibreCAD tool)
-    try:
-        import subprocess
-        result = subprocess.run(['dwg2dxf', dwg_path, dxf_path], 
-                              capture_output=True, timeout=30)
-        if os.path.exists(dxf_path) and os.path.getsize(dxf_path) > 1000:
-            return dxf_path
-    except:
-        pass
-    
-    # Method 3: Try teigha viewer converter
-    try:
-        import subprocess
-        result = subprocess.run(['TeighaExporter', dwg_path, '/tmp/', 'DXF', '2018'], 
-                              capture_output=True, timeout=30)
-        teigha_dxf = dwg_path.replace('.dwg', '.dxf').replace('.DWG', '.dxf')
-        if os.path.exists(teigha_dxf) and os.path.getsize(teigha_dxf) > 1000:
-            return teigha_dxf
-    except:
-        pass
-    
-    # Method 4: Extract text/blocks without conversion (fallback)
-    try:
-        with open(dwg_path, 'rb') as f:
-            content = f.read()
-            
-        # Check DWG signature and extract info
-        if content[:4] == b'AC10' or content[:4] == b'AC12' or content[:4] == b'AC13':
-            # Valid DWG but newer format
-            st.warning("⚠️ DWG format too new for direct conversion")
-            return None
-        else:
-            st.error("❌ Not a valid DWG file")
-            return None
-    except:
-        return None
-
-def detect_existing_sh_marks(dxf_path):
-    """Check if DXF already has SH-XX marks"""
+def find_sh_marks(dxf_path):
+    """Find all SH-XX text marks in DXF"""
     try:
         doc = ezdxf.readfile(dxf_path)
         msp = doc.modelspace()
         
         sh_marks = []
         
-        # Look for TEXT entities with SH pattern
+        # Find TEXT entities with SH pattern
         for entity in msp.query('TEXT MTEXT'):
-            if hasattr(entity, 'dxf'):
-                try:
-                    text_content = entity.dxf.text if hasattr(entity.dxf, 'text') else str(entity)
-                    
-                    # Match SH-XX pattern
-                    match = re.search(r'SH-(\d+)', text_content)
-                    if match:
-                        sh_num = match.group(1)
-                        pos = (entity.dxf.insert.x, entity.dxf.insert.y) if hasattr(entity.dxf, 'insert') else (0, 0)
-                        sh_marks.append({
-                            'sh': f"SH-{sh_num}",
-                            'text': text_content,
-                            'position': pos
-                        })
-                except:
-                    pass
+            try:
+                text_content = entity.dxf.text if hasattr(entity.dxf, 'text') else str(entity)
+                pos = (entity.dxf.insert.x, entity.dxf.insert.y) if hasattr(entity.dxf, 'insert') else (0, 0)
+                
+                # Match SH-XX pattern (case-insensitive)
+                match = re.search(r'SH-(\d+)', text_content, re.IGNORECASE)
+                if match:
+                    sh_num = match.group(1)
+                    sh_marks.append({
+                        'sh': f"SH-{sh_num}",
+                        'position': pos,
+                        'text': text_content
+                    })
+            except:
+                pass
         
-        return sh_marks
-    except:
+        return sorted(sh_marks, key=lambda x: int(re.search(r'\d+', x['sh']).group()))
+    
+    except Exception as e:
         return []
 
-def extract_fixtures_from_sh(dxf_path, sh_marks):
-    """Extract fixture counts around existing SH marks"""
+def count_fixtures_around_sh(dxf_path, sh_marks, radius=3000):
+    """Count fixtures (WC, basin, drain) around each SH mark"""
     try:
         doc = ezdxf.readfile(dxf_path)
         msp = doc.modelspace()
         
-        # Get all fixture blocks
+        bathrooms = []
+        
+        # Find all fixture blocks
         wc_blocks = []
         basin_blocks = []
         drain_blocks = []
         
         for entity in msp.query('INSERT'):
-            name = entity.dxf.name.lower()
-            pos = (entity.dxf.insert.x, entity.dxf.insert.y)
-            
-            if re.search(r'(wc|toilet|closet|ewc|water)', name):
-                wc_blocks.append(pos)
-            elif re.search(r'(basin|sink|wash|lav)', name):
-                basin_blocks.append(pos)
-            elif re.search(r'(drain|fd|gully|mft)', name):
-                drain_blocks.append(pos)
+            try:
+                name = entity.dxf.name.lower()
+                pos = (entity.dxf.insert.x, entity.dxf.insert.y)
+                
+                if any(x in name for x in ['wc', 'toilet', 'closet', 'water']):
+                    wc_blocks.append(pos)
+                elif any(x in name for x in ['basin', 'sink', 'wash', 'lav']):
+                    basin_blocks.append(pos)
+                elif any(x in name for x in ['drain', 'fd', 'gully', 'trap', 'mft']):
+                    drain_blocks.append(pos)
+            except:
+                pass
         
-        # For each SH mark, count nearby fixtures
-        bathrooms = []
-        radius = 3000  # Search radius around SH mark
-        
-        for sh_mark in sh_marks:
-            sh_pos = sh_mark['position']
+        # Count fixtures per SH
+        for sh in sh_marks:
+            pos = sh['position']
             
-            wc_count = sum(1 for w in wc_blocks if distance(sh_pos, w) < radius)
-            basin_count = sum(1 for b in basin_blocks if distance(sh_pos, b) < radius)
-            drain_count = sum(1 for d in drain_blocks if distance(sh_pos, d) < radius)
+            wc_count = sum(1 for w in wc_blocks if distance(pos, w) < radius)
+            basin_count = sum(1 for b in basin_blocks if distance(pos, b) < radius)
+            drain_count = sum(1 for d in drain_blocks if distance(pos, d) < radius)
             
-            bathroom = {
-                'sh': sh_mark['sh'],
-                'center': sh_pos,
+            bathrooms.append({
+                'sh': sh['sh'],
+                'position': pos,
                 'fixtures': {
-                    'WC': max(wc_count, 1),  # At least 1 if SH found
-                    'Wash Basin': basin_count,
-                    'Floor Drain': drain_count
+                    'WC': max(wc_count, 1) if wc_count > 0 else 1,
+                    'Wash Basin': basin_count if basin_count > 0 else 1,
+                    'Floor Drain': drain_count if drain_count > 0 else 1
                 }
-            }
-            bathrooms.append(bathroom)
+            })
         
         return bathrooms
     except:
         return []
-    """Inspect DXF file and show what's inside"""
-    try:
-        doc = ezdxf.readfile(dxf_path)
-        msp = doc.modelspace()
-        
-        # Get all entity types
-        entity_types = {}
-        block_names = set()
-        layer_names = set()
-        
-        for entity in msp:
-            etype = entity.dxftype()
-            entity_types[etype] = entity_types.get(etype, 0) + 1
-            
-            if etype == 'INSERT':
-                block_names.add(entity.dxf.name.lower())
-            
-            if hasattr(entity.dxf, 'layer'):
-                layer_names.add(entity.dxf.layer)
-        
-        return {
-            'entity_types': entity_types,
-            'block_names': sorted(list(block_names)),
-            'layer_names': sorted(list(layer_names)),
-            'total_entities': len(list(msp))
-        }
-    except Exception as e:
-        return {'error': str(e)}
 
-def quick_inspect_dxf(dxf_path, max_entities=3000):
-    """Fast inspection - scan only first N entities"""
-    try:
-        doc = ezdxf.readfile(dxf_path)
-        msp = doc.modelspace()
-        
-        entity_types = {}
-        block_names = set()
-        count = 0
-        
-        for entity in msp:
-            if count > max_entities:
-                break
-            
-            etype = entity.dxftype()
-            entity_types[etype] = entity_types.get(etype, 0) + 1
-            
-            if etype == 'INSERT':
-                try:
-                    name = entity.dxf.name.lower()
-                    block_names.add(name)
-                except:
-                    pass
-            
-            count += 1
-        
-        return {
-            'entity_types': entity_types,
-            'block_names': sorted(list(block_names)),
-            'scanned': count
-        }
-    except Exception as e:
-        return {'error': str(e)}
-
-def inspect_and_show(dxf_path):
-    """Show quick inspection results for large files"""
-    st.write("🔎 Scanning file blocks (this may take 10-30 seconds)...")
+def generate_boq_excel(bathrooms, output_path, project_name="Huliot Project"):
+    """Generate BOQ Excel file"""
     
-    try:
-        info = quick_inspect_dxf(dxf_path, max_entities=3000)
-    except:
-        st.error("❌ File too large or corrupted. Cannot inspect.")
-        return None
-    
-    if 'error' in info:
-        st.error(f"❌ Cannot read file: {info['error']}")
-        return None
-    
-    st.success(f"✅ Scanned {info['scanned']} entities from file")
-    
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("Entities Checked", info['scanned'])
-    with col2:
-        st.metric("Entity Types", len(info['entity_types']))
-    with col3:
-        st.metric("Blocks Found", len(info['block_names']))
-    
-    st.markdown("---")
-    
-    if info['block_names']:
-        st.markdown("### 📦 Block Names in File (first 50)")
-        
-        blocks_str = "\n".join(info['block_names'][:50])
-        st.code(blocks_str, language='text')
-        
-        if len(info['block_names']) > 50:
-            st.info(f"ℹ️ Showing first 50. Total blocks: {len(info['block_names'])}")
-        
-        st.markdown("---")
-        st.markdown("""
-        ### 📋 What to do next:
-        
-        **Copy the block names above (all of them).**
-        
-        **Tell me which are:**
-        - WC / Toilet blocks (which names?)
-        - Basin / Sink blocks (which names?)
-        - Drain / FD blocks (which names?)
-        
-        **Example:**
-        ```
-        WC blocks: TOILET_36X66, WC_110
-        Basin: LAVATORY_24X18, SINK_36X36
-        Drain: FLOOR_DRAIN_4X4, FD_MFT
-        ```
-        
-        **Send this info and I'll update detection instantly.**
-        """)
-    else:
-        st.warning("⚠️ No blocks found. This file might be:")
-        st.write("• A CAD library (symbols only)")
-        st.write("• Fixtures drawn as lines/polylines (not blocks)")
-        st.write("• A very old DWG format")
-    
-    return info
-
-def distance(p1, p2):
-    """Euclidean distance"""
-    return math.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2)
-
-def add_sh_labels_to_dxf(input_dxf, output_dxf, bathrooms, prefix="SH"):
-    """Add SH text labels to DXF at bathroom centers"""
-    doc = ezdxf.readfile(input_dxf)
-    msp = doc.modelspace()
-    
-    for i, bathroom in enumerate(bathrooms):
-        sh_num = f"{prefix}-{str(i+1).zfill(2)}"
-        center = bathroom['center']
-        
-        # Add text entity
-        msp.add_text(
-            sh_num,
-            dxfattribs={
-                'insert': (center[0], center[1], 0),
-                'height': 500,  # Text height
-                'color': 1,  # Red color
-                'layer': 'SH_LABELS',
-                'style': 'Standard'
-            }
-        )
-        
-        # Add circle around label
-        msp.add_circle(
-            center=(center[0], center[1], 0),
-            radius=800,
-            dxfattribs={'color': 1, 'layer': 'SH_LABELS'}
-        )
-        
-        bathroom['sh'] = sh_num
-    
-    doc.saveas(output_dxf)
-    return bathrooms
-
-def generate_boq_excel(bathrooms, output_path, project_name=""):
-    """Generate BOQ Excel matching Huliot template format"""
-    
-    # Material database per fixture
-    materials_db = {
+    # Material rates per fixture
+    materials = {
         'WC': [
             {'desc': 'Huliot DIA.110mm L-3000mm Single Socket Pipe', 'unit': 'MTR', 'qty': 14.15, 'sku': '5751100300-i', 'price': 2461},
             {'desc': 'Huliot DIA.110mm Socket', 'unit': 'NOS.', 'qty': 22, 'sku': '7071740275', 'price': 533},
@@ -431,32 +143,32 @@ def generate_boq_excel(bathrooms, output_path, project_name=""):
         ]
     }
     
-    # Build BOQ rows
+    # Build rows
     rows = []
     sr = 1
     
-    for fixture_type, materials in materials_db.items():
-        for material in materials:
+    for fixture_type, items in materials.items():
+        for item in items:
             row = {
                 'SR. NO.': sr,
-                'DESCRIPTION': material['desc'],
-                'UNIT': material['unit']
+                'DESCRIPTION': item['desc'],
+                'UNIT': item['unit']
             }
             
-            # Quantities per SH
+            # Quantity per SH
             for bathroom in bathrooms:
                 sh = bathroom['sh']
                 fixture_count = bathroom['fixtures'].get(fixture_type, 0)
-                qty = round(fixture_count * material['qty'], 2)
+                qty = round(fixture_count * item['qty'], 2)
                 row[sh] = qty if qty > 0 else ''
             
             # Totals
-            total_qty = sum(bathroom['fixtures'].get(fixture_type, 0) * material['qty'] for bathroom in bathrooms)
-            row['Total QTY'] = round(total_qty, 2)
-            row['SKU'] = material['sku']
-            row['Unit Price'] = material['price']
+            total_qty = sum(bathroom['fixtures'].get(fixture_type, 0) * item['qty'] for bathroom in bathrooms)
+            row['Total QTY'] = round(total_qty, 2) if total_qty > 0 else 0
+            row['SKU'] = item['sku']
+            row['Unit Price'] = item['price']
             row['Discount'] = '35%'
-            row['Total'] = round(total_qty * material['price'] * 0.65, 2)
+            row['Amount'] = round(total_qty * item['price'] * 0.65, 2)
             
             rows.append(row)
             sr += 1
@@ -465,242 +177,161 @@ def generate_boq_excel(bathrooms, output_path, project_name=""):
     
     # Write Excel
     with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
-        df.to_excel(writer, sheet_name='Typical Floor BOQ', index=False)
+        df.to_excel(writer, sheet_name='BOQ', index=False)
         
         # Summary sheet
-        summary = pd.DataFrame([
-            {'Item': 'Project Name', 'Value': project_name},
-            {'Item': 'Total Bathrooms', 'Value': len(bathrooms)},
-            {'Item': 'Total Items', 'Value': len(rows)},
-            {'Item': 'Sub Total', 'Value': df['Total'].sum()},
-            {'Item': 'Tax (18%)', 'Value': df['Total'].sum() * 0.18},
-            {'Item': 'Grand Total', 'Value': df['Total'].sum() * 1.18}
-        ])
-        summary.to_excel(writer, sheet_name='Summary', index=False)
+        total_amount = df['Amount'].sum()
+        summary_data = {
+            'Item': [
+                'Project Name',
+                'Total Bathrooms',
+                'Total Line Items',
+                'Sub Total',
+                'Tax (18%)',
+                'Grand Total'
+            ],
+            'Value': [
+                project_name,
+                len(bathrooms),
+                len(rows),
+                round(total_amount, 2),
+                round(total_amount * 0.18, 2),
+                round(total_amount * 1.18, 2)
+            ]
+        }
+        summary_df = pd.DataFrame(summary_data)
+        summary_df.to_excel(writer, sheet_name='Summary', index=False)
     
     return df
 
-# UI
-tab1, tab2, tab3 = st.tabs(["📤 Upload & Process", "🎯 Review SH Marks", "💾 Download"])
+# Main UI
+tab1, tab2, tab3 = st.tabs(["📤 Upload", "🎯 SH Marks", "💾 BOQ"])
 
 with tab1:
-    st.markdown('<div class="step-box">Upload DXF → Auto detect → Mark SH → Generate BOQ</div>', unsafe_allow_html=True)
+    st.markdown('<div class="info-box"><b>Step 1:</b> Upload DXF with SH marks</div>', unsafe_allow_html=True)
     
-    uploaded = st.file_uploader("Upload DWG or DXF Drawing", type=['dxf', 'dwg'], accept_multiple_files=True)
+    st.markdown("### Before uploading, ensure your DXF has:")
+    st.write("✓ SH-01, SH-02... text marks at each bathroom location")
+    st.write("✓ Fixture blocks (WC, basin, drain)")
+    st.write("✓ Saved as DXF format")
     
-    col1, col2 = st.columns(2)
-    with col1:
-        sh_prefix = st.text_input("SH Prefix", "SH")
-    with col2:
-        grid_size = st.number_input("Detection Radius (mm)", 1000, 10000, 5000, 500)
+    uploaded_file = st.file_uploader("Upload DXF File", type=['dxf'])
     
-    if uploaded:
-        st.markdown(f"### 📁 Processing {len(uploaded)} file(s)")
+    if uploaded_file:
+        # Save file
+        temp_dir = tempfile.gettempdir()
+        dxf_path = os.path.join(temp_dir, uploaded_file.name)
         
-        progress_bar = st.progress(0)
+        with open(dxf_path, 'wb') as f:
+            f.write(uploaded_file.getvalue())
         
-        for file_idx, uploaded_file in enumerate(uploaded):
-            progress = (file_idx + 1) / len(uploaded)
-            progress_bar.progress(progress)
+        st.success(f"✅ {uploaded_file.name} uploaded ({uploaded_file.size / 1024 / 1024:.1f} MB)")
+        
+        # Find SH marks
+        if st.button("🔍 Find SH Marks", type="primary", use_container_width=True):
+            with st.spinner("Scanning for SH marks..."):
+                sh_marks = find_sh_marks(dxf_path)
             
-            # Determine file type
-            is_dwg = uploaded_file.name.lower().endswith('.dwg')
-            
-            # Save uploaded file to temp directory
-            temp_dir = tempfile.gettempdir()
-            
-            if is_dwg:
-                input_path = os.path.join(temp_dir, f"input_{uploaded_file.name}")
+            if sh_marks:
+                st.session_state.sh_marks = sh_marks
+                st.session_state.dxf_path = dxf_path
+                st.success(f"✅ Found {len(sh_marks)} SH marks")
+                st.info(f"Marks: {', '.join([m['sh'] for m in sh_marks])}")
             else:
-                input_path = os.path.join(temp_dir, f"input_{uploaded_file.name}")
-            
-            with open(input_path, 'wb') as f:
-                f.write(uploaded_file.getvalue())
-            
-            st.info(f"**{uploaded_file.name}** ({uploaded_file.size / 1024:.1f} KB)")
-            
-            # Convert DWG to DXF if needed
-            if is_dwg:
-                st.write("🔄 Converting DWG to DXF...")
-                with st.spinner("Trying multiple conversion methods..."):
-                    dxf_path = convert_dwg_to_dxf_advanced(input_path)
-                
-                if dxf_path:
-                    st.success("✅ DWG converted to DXF")
-                    process_path = dxf_path
-                else:
-                    st.error("❌ Cannot convert DWG (format too new)")
-                    
-                    st.markdown("""
-                    ### 💡 Solution: Use Online Converter
-                    
-                    Your DWG is newer format. Use free online tool:
-                    
-                    **Option A: CloudConvert (Recommended)**
-                    1. Go to https://cloudconvert.com/dwg-to-dxf
-                    2. Upload your DWG file
-                    3. Select "AutoCAD 2018 DXF" format
-                    4. Download DXF
-                    5. Upload DXF to this app
-                    
-                    **Option B: Zamzar**
-                    1. Go to https://www.zamzar.com/convert/dwg-to-dxf/
-                    2. Upload DWG
-                    3. Convert to DXF
-                    4. Download & upload to app
-                    
-                    **Option C: AutoCAD (If Available)**
-                    1. Open DWG in AutoCAD
-                    2. File > Export > Export to DXF
-                    3. Save as "AutoCAD 2018 DXF"
-                    4. Upload DXF
-                    """)
-                    st.stop()
-            else:
-                process_path = input_path
-            
-            # Validate and process
-            file_content = uploaded_file.getvalue()
-            is_valid_dxf = file_content.startswith(b'999') or file_content.startswith(b'  0') or b'SECTION' in file_content
-            
-            if not is_valid_dxf and not is_dwg:
-                st.warning("⚠️ File might be corrupted. Attempting to process...")
-            
-            # Process file
-            if st.button(f"🔍 Detect & Mark {uploaded_file.name}", type="primary", use_container_width=True):
-                with st.spinner(f"Analyzing {uploaded_file.name}..."):
-                    # Check for existing SH marks first
-                    existing_sh = detect_existing_sh_marks(process_path)
-                    
-                    if existing_sh:
-                        st.success(f"✅ Found {len(existing_sh)} existing SH marks in drawing")
-                        st.info(f"Marks: {', '.join([sh['sh'] for sh in existing_sh])}")
-                        
-                        # Extract fixtures around existing SH marks
-                        bathrooms = extract_fixtures_from_sh(process_path, existing_sh)
-                        
-                        if bathrooms:
-                            st.success(f"✅ Extracted fixtures for {len(bathrooms)} shafts")
-                            st.session_state.bathrooms = bathrooms
-                            st.session_state.marked_dxf_path = process_path
-                        else:
-                            st.warning("⚠️ Could not extract fixtures from marks")
-                    else:
-                        st.info("No existing SH marks found. Running auto-detection...")
-                        bathrooms = detect_bathrooms_spatial_clustering(process_path, grid_size)
-                        
-                        if not bathrooms:
-                            st.error(f"❌ No bathrooms detected in {uploaded_file.name}")
-                            
-                            # Show inspector
-                            st.info("💡 Let's check what's in this file...")
-                            if st.button(f"🔎 Inspect {uploaded_file.name}", use_container_width=True):
-                                inspect_info = inspect_and_show(process_path)
-                                
-                                if inspect_info and 'block_names' in inspect_info:
-                                    st.markdown("""
-                                    ### Next Steps:
-                                    
-                                    **Share the block names above with me.** They tell us what fixture symbols are in your drawing.
-                                    
-                                    **Common block names by CAD software:**
-                                    - Revit: "Toilet", "Lavatory", "Sink", "Drain"
-                                    - Civil3D: "WC", "BASIN", "FD_TRAP"
-                                    - Huliot: "WC_110", "BASIN_50", "FD_MFT"
-                                    - Generic: "TOILET", "SINK", "DRAIN"
-                                    
-                                    **Then I can update detection to find your blocks automatically.**
-                                    """)
-                        else:
-                            st.success(f"✅ Found {len(bathrooms)} bathrooms in {uploaded_file.name}")
-                            
-                            # Mark DXF
-                            temp_dir = tempfile.gettempdir()
-                            marked_path = os.path.join(temp_dir, f"marked_{uploaded_file.name.replace('.dwg', '.dxf').replace('.DWG', '.dxf')}")
-                            bathrooms = add_sh_labels_to_dxf(process_path, marked_path, bathrooms, sh_prefix)
-                            
-                            st.session_state.bathrooms = bathrooms
-                            st.session_state.marked_dxf_path = marked_path
-                            
-                            st.success(f"✅ Added SH labels to {uploaded_file.name}")
-            
-            st.divider()
+                st.error("❌ No SH marks found in file")
+                st.warning("**Action:** Add SH-01, SH-02... text marks in AutoCAD before uploading")
 
 with tab2:
-    if st.session_state.bathrooms:
-        st.markdown("### 🎯 Detected Bathrooms with SH Labels")
+    if st.session_state.sh_marks:
+        st.markdown('<div class="info-box"><b>Step 2:</b> Review detected SH marks</div>', unsafe_allow_html=True)
         
-        cols = st.columns(min(len(st.session_state.bathrooms), 4))
+        # Show SH marks
+        st.markdown("### 📍 SH Marks Found")
         
-        for i, bathroom in enumerate(st.session_state.bathrooms):
-            with cols[i % 4]:
-                st.markdown(f"**{bathroom['sh']}**")
-                st.metric("WC", bathroom['fixtures'].get('WC', 0))
-                st.metric("Basin", bathroom['fixtures'].get('Wash Basin', 0))
-                st.metric("FD", bathroom['fixtures'].get('Floor Drain', 0))
+        cols = st.columns(min(len(st.session_state.sh_marks), 5))
+        for i, sh in enumerate(st.session_state.sh_marks):
+            with cols[i % 5]:
+                st.markdown(f"**{sh['sh']}**")
+                st.caption(f"Position: ({sh['position'][0]:.0f}, {sh['position'][1]:.0f})")
         
         st.markdown("---")
         
-        # BOQ Preview
-        if st.button("📊 Generate BOQ Preview"):
-            temp_dir = tempfile.gettempdir()
-            boq_path = os.path.join(temp_dir, "preview_boq.xlsx")
-            df = generate_boq_excel(st.session_state.bathrooms, boq_path)
+        # Count fixtures
+        if st.button("📊 Count Fixtures Around SH", type="primary", use_container_width=True):
+            with st.spinner("Counting fixtures..."):
+                bathrooms = count_fixtures_around_sh(st.session_state.dxf_path, st.session_state.sh_marks)
             
-            st.dataframe(df.head(20), use_container_width=True)
-            
-            # Metrics
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.markdown('<div class="metric-green"><h3>Total Items</h3><h2>' + str(len(df)) + '</h2></div>', unsafe_allow_html=True)
-            with col2:
-                total = df['Total'].sum()
-                st.markdown(f'<div class="metric-green"><h3>Sub Total</h3><h2>₹{total/100000:.1f}L</h2></div>', unsafe_allow_html=True)
-            with col3:
-                grand = total * 1.18
-                st.markdown(f'<div class="metric-green"><h3>Grand Total</h3><h2>₹{grand/100000:.1f}L</h2></div>', unsafe_allow_html=True)
+            if bathrooms:
+                st.session_state.bathrooms = bathrooms
+                st.success(f"✅ Fixtures counted for {len(bathrooms)} shafts")
+                
+                # Show summary
+                st.markdown("### 🚿 Fixture Summary")
+                summary_data = []
+                for b in bathrooms:
+                    summary_data.append({
+                        'SH': b['sh'],
+                        'WC': b['fixtures'].get('WC', 0),
+                        'Basin': b['fixtures'].get('Wash Basin', 0),
+                        'Drain': b['fixtures'].get('Floor Drain', 0)
+                    })
+                
+                df_summary = pd.DataFrame(summary_data)
+                st.dataframe(df_summary, use_container_width=True)
+            else:
+                st.error("❌ Could not count fixtures")
     else:
-        st.info("No bathrooms detected yet. Upload DXF and detect first.")
+        st.info("📤 Upload DXF and find SH marks first")
 
 with tab3:
-    if st.session_state.marked_dxf_path and st.session_state.bathrooms:
-        st.markdown("### 💾 Download Files")
+    if 'bathrooms' in st.session_state and st.session_state.bathrooms:
+        st.markdown('<div class="info-box"><b>Step 3:</b> Generate and download BOQ</div>', unsafe_allow_html=True)
         
-        project_name = st.text_input("Project Name", "Huliot_Project")
-        
-        col1, col2 = st.columns(2)
+        col1, col2 = st.columns([2, 1])
         
         with col1:
-            st.markdown("**📐 Marked DXF Drawing**")
-            st.info(f"SH labels added at {len(st.session_state.bathrooms)} locations")
-            
-            with open(st.session_state.marked_dxf_path, 'rb') as f:
-                st.download_button(
-                    "⬇️ Download Marked DXF",
-                    f.read(),
-                    file_name=f"{project_name}_marked.dxf",
-                    mime="application/dxf"
-                )
-        
+            project_name = st.text_input("Project Name", "Huliot Project")
         with col2:
-            st.markdown("**📊 BOQ Excel**")
-            st.info(f"BOQ for {len(st.session_state.bathrooms)} shafts")
-            
+            st.write("")
+            st.write("")
+        
+        if st.button("📋 Generate BOQ Excel", type="primary", use_container_width=True):
             temp_dir = tempfile.gettempdir()
             boq_path = os.path.join(temp_dir, f"{project_name}_BOQ.xlsx")
-            generate_boq_excel(st.session_state.bathrooms, boq_path, project_name)
             
+            with st.spinner("Generating BOQ..."):
+                df = generate_boq_excel(st.session_state.bathrooms, boq_path, project_name)
+            
+            st.success("✅ BOQ generated successfully!")
+            
+            # Show preview
+            st.markdown("### 📊 BOQ Preview (first 10 rows)")
+            st.dataframe(df.head(10), use_container_width=True)
+            
+            # Metrics
+            total_amount = df['Amount'].sum()
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                st.markdown(f'<div class="metric-card"><h4>Items</h4><h2>{len(df)}</h2></div>', unsafe_allow_html=True)
+            with col2:
+                st.markdown(f'<div class="metric-card"><h4>Sub Total</h4><h2>₹{total_amount/100000:.1f}L</h2></div>', unsafe_allow_html=True)
+            with col3:
+                st.markdown(f'<div class="metric-card"><h4>Grand Total</h4><h2>₹{total_amount*1.18/100000:.1f}L</h2></div>', unsafe_allow_html=True)
+            
+            st.markdown("---")
+            
+            # Download button
             with open(boq_path, 'rb') as f:
                 st.download_button(
                     "⬇️ Download BOQ Excel",
                     f.read(),
                     file_name=f"{project_name}_BOQ.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True
                 )
-        
-        st.success("✅ Both files ready for download")
     else:
-        st.info("Process drawing first to generate files")
+        st.info("🎯 Find SH marks and count fixtures first")
 
 st.markdown("---")
-st.markdown("**Huliot AutoBOQ v1.0** | Automated SH Marking + BOQ Generation")
+st.markdown("<p style='text-align:center; color:#666;'><b>Huliot BOQ Generator v2.0</b> | Simple & Reliable</p>", unsafe_allow_html=True)
