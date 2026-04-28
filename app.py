@@ -8,13 +8,14 @@ Huliot Drawing Marker + BOQ Generator
 import streamlit as st
 import pandas as pd
 import ezdxf
-from ezdxf.addons.drawing import matplotlib
 import io
 import base64
 from pathlib import Path
 from collections import defaultdict, Counter
 import re
 import math
+import tempfile
+import os
 
 st.set_page_config(page_title="Huliot Auto SH Marker + BOQ", layout="wide")
 
@@ -214,8 +215,10 @@ with tab1:
         grid_size = st.number_input("Detection Radius (mm)", 1000, 10000, 5000, 500)
     
     if uploaded:
-        # Save uploaded file
-        input_path = f"/home/claude/input_{uploaded.name}"
+        # Save uploaded file to temp directory
+        temp_dir = tempfile.gettempdir()
+        input_path = os.path.join(temp_dir, f"input_{uploaded.name}")
+        
         with open(input_path, 'wb') as f:
             f.write(uploaded.getvalue())
         
@@ -232,7 +235,8 @@ with tab1:
                     st.success(f"✅ Found {len(bathrooms)} bathrooms")
                     
                     # Mark DXF
-                    marked_path = f"/home/claude/marked_{uploaded.name}"
+                    temp_dir = tempfile.gettempdir()
+                    marked_path = os.path.join(temp_dir, f"marked_{uploaded.name}")
                     bathrooms = add_sh_labels_to_dxf(input_path, marked_path, bathrooms, sh_prefix)
                     
                     st.session_state.bathrooms = bathrooms
@@ -257,7 +261,8 @@ with tab2:
         
         # BOQ Preview
         if st.button("📊 Generate BOQ Preview"):
-            boq_path = "/home/claude/preview_boq.xlsx"
+            temp_dir = tempfile.gettempdir()
+            boq_path = os.path.join(temp_dir, "preview_boq.xlsx")
             df = generate_boq_excel(st.session_state.bathrooms, boq_path)
             
             st.dataframe(df.head(20), use_container_width=True)
@@ -299,7 +304,8 @@ with tab3:
             st.markdown("**📊 BOQ Excel**")
             st.info(f"BOQ for {len(st.session_state.bathrooms)} shafts")
             
-            boq_path = f"/home/claude/{project_name}_BOQ.xlsx"
+            temp_dir = tempfile.gettempdir()
+            boq_path = os.path.join(temp_dir, f"{project_name}_BOQ.xlsx")
             generate_boq_excel(st.session_state.bathrooms, boq_path, project_name)
             
             with open(boq_path, 'rb') as f:
