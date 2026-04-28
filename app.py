@@ -164,7 +164,84 @@ def convert_dwg_to_dxf_advanced(dwg_path):
     except:
         return None
 
-def inspect_dxf_contents(dxf_path):
+def detect_existing_sh_marks(dxf_path):
+    """Check if DXF already has SH-XX marks"""
+    try:
+        doc = ezdxf.readfile(dxf_path)
+        msp = doc.modelspace()
+        
+        sh_marks = []
+        
+        # Look for TEXT entities with SH pattern
+        for entity in msp.query('TEXT MTEXT'):
+            if hasattr(entity, 'dxf'):
+                try:
+                    text_content = entity.dxf.text if hasattr(entity.dxf, 'text') else str(entity)
+                    
+                    # Match SH-XX pattern
+                    match = re.search(r'SH-(\d+)', text_content)
+                    if match:
+                        sh_num = match.group(1)
+                        pos = (entity.dxf.insert.x, entity.dxf.insert.y) if hasattr(entity.dxf, 'insert') else (0, 0)
+                        sh_marks.append({
+                            'sh': f"SH-{sh_num}",
+                            'text': text_content,
+                            'position': pos
+                        })
+                except:
+                    pass
+        
+        return sh_marks
+    except:
+        return []
+
+def extract_fixtures_from_sh(dxf_path, sh_marks):
+    """Extract fixture counts around existing SH marks"""
+    try:
+        doc = ezdxf.readfile(dxf_path)
+        msp = doc.modelspace()
+        
+        # Get all fixture blocks
+        wc_blocks = []
+        basin_blocks = []
+        drain_blocks = []
+        
+        for entity in msp.query('INSERT'):
+            name = entity.dxf.name.lower()
+            pos = (entity.dxf.insert.x, entity.dxf.insert.y)
+            
+            if re.search(r'(wc|toilet|closet|ewc|water)', name):
+                wc_blocks.append(pos)
+            elif re.search(r'(basin|sink|wash|lav)', name):
+                basin_blocks.append(pos)
+            elif re.search(r'(drain|fd|gully|mft)', name):
+                drain_blocks.append(pos)
+        
+        # For each SH mark, count nearby fixtures
+        bathrooms = []
+        radius = 3000  # Search radius around SH mark
+        
+        for sh_mark in sh_marks:
+            sh_pos = sh_mark['position']
+            
+            wc_count = sum(1 for w in wc_blocks if distance(sh_pos, w) < radius)
+            basin_count = sum(1 for b in basin_blocks if distance(sh_pos, b) < radius)
+            drain_count = sum(1 for d in drain_blocks if distance(sh_pos, d) < radius)
+            
+            bathroom = {
+                'sh': sh_mark['sh'],
+                'center': sh_pos,
+                'fixtures': {
+                    'WC': max(wc_count, 1),  # At least 1 if SH found
+                    'Wash Basin': basin_count,
+                    'Floor Drain': drain_count
+                }
+            }
+            bathrooms.append(bathroom)
+        
+        return bathrooms
+    except:
+        return []
     """Inspect DXF file and show what's inside"""
     try:
         doc = ezdxf.readfile(dxf_path)
@@ -442,42 +519,60 @@ with tab1:
             # Process file
             if st.button(f"🔍 Detect & Mark {uploaded_file.name}", type="primary", use_container_width=True):
                 with st.spinner(f"Analyzing {uploaded_file.name}..."):
-                    bathrooms = detect_bathrooms_spatial_clustering(process_path, grid_size)
+                    # Check for existing SH marks first
+                    existing_sh = detect_existing_sh_marks(process_path)
                     
-                    if not bathrooms:
-                        st.error(f"❌ No bathrooms detected in {uploaded_file.name}")
+                    if existing_sh:
+                        st.success(f"✅ Found {len(existing_sh)} existing SH marks in drawing")
+                        st.info(f"Marks: {', '.join([sh['sh'] for sh in existing_sh])}")
                         
-                        # Show inspector
-                        st.info("💡 Let's check what's in this file...")
-                        if st.button(f"🔎 Inspect {uploaded_file.name}", use_container_width=True):
-                            inspect_info = inspect_and_show(process_path)
-                            
-                            if inspect_info and 'block_names' in inspect_info:
-                                st.markdown("""
-                                ### Next Steps:
-                                
-                                **Share the block names above with me.** They tell us what fixture symbols are in your drawing.
-                                
-                                **Common block names by CAD software:**
-                                - Revit: "Toilet", "Lavatory", "Sink", "Drain"
-                                - Civil3D: "WC", "BASIN", "FD_TRAP"
-                                - Huliot: "WC_110", "BASIN_50", "FD_MFT"
-                                - Generic: "TOILET", "SINK", "DRAIN"
-                                
-                                **Then I can update detection to find your blocks automatically.**
-                                """)
+                        # Extract fixtures around existing SH marks
+                        bathrooms = extract_fixtures_from_sh(process_path, existing_sh)
+                        
+                        if bathrooms:
+                            st.success(f"✅ Extracted fixtures for {len(bathrooms)} shafts")
+                            st.session_state.bathrooms = bathrooms
+                            st.session_state.marked_dxf_path = process_path
+                        else:
+                            st.warning("⚠️ Could not extract fixtures from marks")
                     else:
-                        st.success(f"✅ Found {len(bathrooms)} bathrooms in {uploaded_file.name}")
+                        st.info("No existing SH marks found. Running auto-detection...")
+                        bathrooms = detect_bathrooms_spatial_clustering(process_path, grid_size)
                         
-                        # Mark DXF
-                        temp_dir = tempfile.gettempdir()
-                        marked_path = os.path.join(temp_dir, f"marked_{uploaded_file.name.replace('.dwg', '.dxf').replace('.DWG', '.dxf')}")
-                        bathrooms = add_sh_labels_to_dxf(process_path, marked_path, bathrooms, sh_prefix)
-                        
-                        st.session_state.bathrooms = bathrooms
-                        st.session_state.marked_dxf_path = marked_path
-                        
-                        st.success(f"✅ Added SH labels to {uploaded_file.name}")
+                        if not bathrooms:
+                            st.error(f"❌ No bathrooms detected in {uploaded_file.name}")
+                            
+                            # Show inspector
+                            st.info("💡 Let's check what's in this file...")
+                            if st.button(f"🔎 Inspect {uploaded_file.name}", use_container_width=True):
+                                inspect_info = inspect_and_show(process_path)
+                                
+                                if inspect_info and 'block_names' in inspect_info:
+                                    st.markdown("""
+                                    ### Next Steps:
+                                    
+                                    **Share the block names above with me.** They tell us what fixture symbols are in your drawing.
+                                    
+                                    **Common block names by CAD software:**
+                                    - Revit: "Toilet", "Lavatory", "Sink", "Drain"
+                                    - Civil3D: "WC", "BASIN", "FD_TRAP"
+                                    - Huliot: "WC_110", "BASIN_50", "FD_MFT"
+                                    - Generic: "TOILET", "SINK", "DRAIN"
+                                    
+                                    **Then I can update detection to find your blocks automatically.**
+                                    """)
+                        else:
+                            st.success(f"✅ Found {len(bathrooms)} bathrooms in {uploaded_file.name}")
+                            
+                            # Mark DXF
+                            temp_dir = tempfile.gettempdir()
+                            marked_path = os.path.join(temp_dir, f"marked_{uploaded_file.name.replace('.dwg', '.dxf').replace('.DWG', '.dxf')}")
+                            bathrooms = add_sh_labels_to_dxf(process_path, marked_path, bathrooms, sh_prefix)
+                            
+                            st.session_state.bathrooms = bathrooms
+                            st.session_state.marked_dxf_path = marked_path
+                            
+                            st.success(f"✅ Added SH labels to {uploaded_file.name}")
             
             st.divider()
 
