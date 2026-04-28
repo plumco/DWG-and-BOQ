@@ -51,8 +51,6 @@ def detect_bathrooms_spatial_clustering(dxf_path, grid_size=5000):
     except Exception as e:
         error_msg = str(e)
         st.error(f"❌ Cannot read DXF file")
-        st.warning("**Fix this:**\n1. Open file in AutoCAD\n2. File > Save As > AutoCAD 2018 DXF\n3. Upload DXF (not DWG)")
-        st.info(f"Error detail: {error_msg[:100]}")
         return []
     
     wc_blocks = []
@@ -411,21 +409,31 @@ with tab1:
                             st.session_state.bathrooms = bathrooms
                             st.session_state.marked_dxf_path = process_path
                         else:
-                            st.warning("⚠️ Could not extract fixtures from marks. Did you check the block names?")
+                            st.warning("⚠️ Could not extract fixtures from marks. Automatically inspecting file...")
+                            
+                            # Auto-inspect if fixtures are missing!
+                            inspect_info = inspect_and_show(process_path)
+                            if inspect_info and 'block_names' in inspect_info:
+                                st.markdown("""
+                                ### 💡 Next Steps:
+                                Look at the **Block Names Found** above. Find the names of your WC and Basin blocks and share them here or add them to the regex logic in the code!
+                                """)
                     else:
                         st.info("No existing SH marks found. Running auto-detection...")
                         bathrooms = detect_bathrooms_spatial_clustering(process_path, grid_size)
                         
                         if not bathrooms:
                             st.error(f"❌ No bathrooms detected in {uploaded_file.name}")
-                            st.info("💡 Let's check what's in this file...")
-                            if st.button(f"🔎 Inspect {uploaded_file.name}", use_container_width=True):
-                                inspect_info = inspect_and_show(process_path)
-                                if inspect_info and 'block_names' in inspect_info:
-                                    st.markdown("""
-                                    ### Next Steps:
-                                    Look at the **Block Names Found** above. Find the names of your WC and Basin blocks and add them to lines 51 and 87 of your `app.py` script!
-                                    """)
+                            st.info("💡 Automatically inspecting the file to find your block names...")
+                            
+                            # AUTO-INSPECT HAPPENS HERE (No nested button)
+                            inspect_info = inspect_and_show(process_path)
+                            
+                            if inspect_info and 'block_names' in inspect_info:
+                                st.markdown("""
+                                ### 💡 Next Steps:
+                                Look at the **Block Names Found** above. Find the names of your WC and Basin blocks and share them here!
+                                """)
                         else:
                             st.success(f"✅ Found {len(bathrooms)} bathrooms in {uploaded_file.name}")
                             marked_path = os.path.join(temp_dir, f"marked_{uploaded_file.name.replace('.dwg', '.dxf').replace('.DWG', '.dxf')}")
