@@ -113,35 +113,56 @@ def distance(p1, p2):
     """Euclidean distance"""
     return math.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2)
 
-def convert_dwg_to_dxf(dwg_path):
+def convert_dwg_to_dxf_advanced(dwg_path):
     """
-    Try to convert DWG to DXF using available methods
-    Returns DXF path if successful, None if fails
+    Advanced DWG to DXF conversion with multiple fallback methods
     """
+    dxf_path = dwg_path.replace('.dwg', '_converted.dxf').replace('.DWG', '_converted.dxf')
+    
+    # Method 1: ezdxf native read (DWG 2000-2018)
     try:
-        # Method 1: Try using ezdxf's DWG support (DWG 2000-2018)
         doc = ezdxf.readfile(dwg_path)
-        
-        # Save as DXF
-        dxf_path = dwg_path.replace('.dwg', '_converted.dxf').replace('.DWG', '_converted.dxf')
         doc.saveas(dxf_path)
         return dxf_path
-        
-    except Exception as e:
-        try:
-            # Method 2: Try system dwg2dxf command (if installed)
-            import subprocess
-            dxf_path = dwg_path.replace('.dwg', '_converted.dxf').replace('.DWG', '_converted.dxf')
-            
-            result = subprocess.run(['dwg2dxf', dwg_path, dxf_path], 
-                                  capture_output=True, timeout=30)
-            
-            if os.path.exists(dxf_path):
-                return dxf_path
-        except:
-            pass
+    except Exception as e1:
+        pass
     
-    return None
+    # Method 2: Try system dwg2dxf (LibreCAD tool)
+    try:
+        import subprocess
+        result = subprocess.run(['dwg2dxf', dwg_path, dxf_path], 
+                              capture_output=True, timeout=30)
+        if os.path.exists(dxf_path) and os.path.getsize(dxf_path) > 1000:
+            return dxf_path
+    except:
+        pass
+    
+    # Method 3: Try teigha viewer converter
+    try:
+        import subprocess
+        result = subprocess.run(['TeighaExporter', dwg_path, '/tmp/', 'DXF', '2018'], 
+                              capture_output=True, timeout=30)
+        teigha_dxf = dwg_path.replace('.dwg', '.dxf').replace('.DWG', '.dxf')
+        if os.path.exists(teigha_dxf) and os.path.getsize(teigha_dxf) > 1000:
+            return teigha_dxf
+    except:
+        pass
+    
+    # Method 4: Extract text/blocks without conversion (fallback)
+    try:
+        with open(dwg_path, 'rb') as f:
+            content = f.read()
+            
+        # Check DWG signature and extract info
+        if content[:4] == b'AC10' or content[:4] == b'AC12' or content[:4] == b'AC13':
+            # Valid DWG but newer format
+            st.warning("⚠️ DWG format too new for direct conversion")
+            return None
+        else:
+            st.error("❌ Not a valid DWG file")
+            return None
+    except:
+        return None
 
 def distance(p1, p2):
     """Euclidean distance"""
@@ -297,14 +318,40 @@ with tab1:
             # Convert DWG to DXF if needed
             if is_dwg:
                 st.write("🔄 Converting DWG to DXF...")
-                dxf_path = convert_dwg_to_dxf(input_path)
+                with st.spinner("Trying multiple conversion methods..."):
+                    dxf_path = convert_dwg_to_dxf_advanced(input_path)
                 
                 if dxf_path:
                     st.success("✅ DWG converted to DXF")
                     process_path = dxf_path
                 else:
-                    st.error("❌ Could not convert DWG. Trying ezdxf direct read...")
-                    process_path = input_path
+                    st.error("❌ Cannot convert DWG (format too new)")
+                    
+                    st.markdown("""
+                    ### 💡 Solution: Use Online Converter
+                    
+                    Your DWG is newer format. Use free online tool:
+                    
+                    **Option A: CloudConvert (Recommended)**
+                    1. Go to https://cloudconvert.com/dwg-to-dxf
+                    2. Upload your DWG file
+                    3. Select "AutoCAD 2018 DXF" format
+                    4. Download DXF
+                    5. Upload DXF to this app
+                    
+                    **Option B: Zamzar**
+                    1. Go to https://www.zamzar.com/convert/dwg-to-dxf/
+                    2. Upload DWG
+                    3. Convert to DXF
+                    4. Download & upload to app
+                    
+                    **Option C: AutoCAD (If Available)**
+                    1. Open DWG in AutoCAD
+                    2. File > Export > Export to DXF
+                    3. Save as "AutoCAD 2018 DXF"
+                    4. Upload DXF
+                    """)
+                    st.stop()
             else:
                 process_path = input_path
             
