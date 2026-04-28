@@ -38,7 +38,7 @@ def distance(p1, p2):
     return math.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2)
 
 def find_sh_marks(dxf_path):
-    """Find all SH-XX text marks in DXF"""
+    """Find all SH marks in DXF - handles SH-01, SH01, SH-12, SH12 formats"""
     try:
         doc = ezdxf.readfile(dxf_path)
         msp = doc.modelspace()
@@ -51,10 +51,10 @@ def find_sh_marks(dxf_path):
                 text_content = entity.dxf.text if hasattr(entity.dxf, 'text') else str(entity)
                 pos = (entity.dxf.insert.x, entity.dxf.insert.y) if hasattr(entity.dxf, 'insert') else (0, 0)
                 
-                # Match SH-XX pattern (case-insensitive)
-                match = re.search(r'SH-(\d+)', text_content, re.IGNORECASE)
+                # Match SH pattern (SH-01, SH01, SH-1, SH1, etc) - case-insensitive
+                match = re.search(r'SH\s*-?\s*(\d+)', text_content, re.IGNORECASE)
                 if match:
-                    sh_num = match.group(1)
+                    sh_num = match.group(1).strip()
                     sh_marks.append({
                         'sh': f"SH-{sh_num}",
                         'position': pos,
