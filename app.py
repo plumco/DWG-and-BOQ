@@ -39,24 +39,45 @@ if 'marked_dxf_path' not in st.session_state:
 
 def detect_bathrooms_spatial_clustering(dxf_path, grid_size=5000):
     """Detect bathrooms by clustering WC blocks spatially"""
-    doc = ezdxf.readfile(dxf_path)
-    msp = doc.modelspace()
+    try:
+        # Check if file exists and has content
+        if not os.path.exists(dxf_path):
+            st.error(f"❌ File not found: {dxf_path}")
+            return []
+        
+        file_size = os.path.getsize(dxf_path)
+        if file_size < 100:
+            st.error("❌ File too small - invalid DXF")
+            return []
+        
+        # Try to read DXF
+        doc = ezdxf.readfile(dxf_path)
+        msp = doc.modelspace()
+    except Exception as e:
+        error_msg = str(e)
+        st.error(f"❌ Cannot read DXF file")
+        st.warning("**Fix this:**\n1. Open file in AutoCAD\n2. File > Save As > AutoCAD 2018 DXF\n3. Upload DXF (not DWG)")
+        st.info(f"Error detail: {error_msg[:100]}")
+        return []
     
     # Find all blocks
     wc_blocks = []
     basin_blocks = []
     drain_blocks = []
     
-    for entity in msp.query('INSERT'):
-        name = entity.dxf.name.lower()
-        pos = (entity.dxf.insert.x, entity.dxf.insert.y)
-        
-        if re.search(r'(wc|toilet|closet|ewc)', name):
-            wc_blocks.append(pos)
-        elif re.search(r'(basin|sink|wash|lav)', name):
-            basin_blocks.append(pos)
-        elif re.search(r'(drain|fd|gully)', name):
-            drain_blocks.append(pos)
+    try:
+        for entity in msp.query('INSERT'):
+            name = entity.dxf.name.lower()
+            pos = (entity.dxf.insert.x, entity.dxf.insert.y)
+            
+            if re.search(r'(wc|toilet|closet|ewc)', name):
+                wc_blocks.append(pos)
+            elif re.search(r'(basin|sink|wash|lav)', name):
+                basin_blocks.append(pos)
+            elif re.search(r'(drain|fd|gully)', name):
+                drain_blocks.append(pos)
+    except Exception as e:
+        st.warning(f"Could not parse blocks: {str(e)[:50]}")
     
     if not wc_blocks:
         return []
@@ -222,27 +243,37 @@ with tab1:
         with open(input_path, 'wb') as f:
             f.write(uploaded.getvalue())
         
-        st.success(f"✅ {uploaded.name} uploaded")
+        st.success(f"✅ {uploaded.name} uploaded ({uploaded.size / 1024:.1f} KB)")
         
-        if st.button("🔍 Detect & Mark Bathrooms", type="primary"):
-            with st.spinner("Analyzing drawing..."):
-                # Detect
-                bathrooms = detect_bathrooms_spatial_clustering(input_path, grid_size)
-                
-                if not bathrooms:
-                    st.error("❌ No bathrooms detected. Check DXF has WC/toilet blocks.")
-                else:
-                    st.success(f"✅ Found {len(bathrooms)} bathrooms")
+        # Validate file format
+        file_content = uploaded.getvalue()
+        is_valid_dxf = file_content.startswith(b'999') or file_content.startswith(b'  0') or b'SECTION' in file_content
+        
+        if not is_valid_dxf and uploaded.name.lower().endswith('.dxf'):
+            st.warning("⚠️ File might be DWG, not DXF. Try converting in AutoCAD first.")
+        
+        if uploaded.name.lower().endswith('.dwg'):
+            st.error("❌ DWG format not supported. Must convert to DXF first:\n1. Open in AutoCAD\n2. File > Save As > DXF (2018)\n3. Upload DXF")
+        else:
+            if st.button("🔍 Detect & Mark Bathrooms", type="primary", use_container_width=True):
+                with st.spinner("Analyzing drawing..."):
+                    # Detect
+                    bathrooms = detect_bathrooms_spatial_clustering(input_path, grid_size)
                     
-                    # Mark DXF
-                    temp_dir = tempfile.gettempdir()
-                    marked_path = os.path.join(temp_dir, f"marked_{uploaded.name}")
-                    bathrooms = add_sh_labels_to_dxf(input_path, marked_path, bathrooms, sh_prefix)
-                    
-                    st.session_state.bathrooms = bathrooms
-                    st.session_state.marked_dxf_path = marked_path
-                    
-                    st.success(f"✅ Added SH labels to drawing")
+                    if not bathrooms:
+                        st.error("❌ No bathrooms detected. Check DXF has WC/toilet blocks.")
+                    else:
+                        st.success(f"✅ Found {len(bathrooms)} bathrooms")
+                        
+                        # Mark DXF
+                        temp_dir = tempfile.gettempdir()
+                        marked_path = os.path.join(temp_dir, f"marked_{uploaded.name}")
+                        bathrooms = add_sh_labels_to_dxf(input_path, marked_path, bathrooms, sh_prefix)
+                        
+                        st.session_state.bathrooms = bathrooms
+                        st.session_state.marked_dxf_path = marked_path
+                        
+                        st.success(f"✅ Added SH labels to drawing")
 
 with tab2:
     if st.session_state.bathrooms:
