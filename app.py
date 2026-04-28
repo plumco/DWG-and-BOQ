@@ -113,6 +113,40 @@ def distance(p1, p2):
     """Euclidean distance"""
     return math.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2)
 
+def convert_dwg_to_dxf(dwg_path):
+    """
+    Try to convert DWG to DXF using available methods
+    Returns DXF path if successful, None if fails
+    """
+    try:
+        # Method 1: Try using ezdxf's DWG support (DWG 2000-2018)
+        doc = ezdxf.readfile(dwg_path)
+        
+        # Save as DXF
+        dxf_path = dwg_path.replace('.dwg', '_converted.dxf').replace('.DWG', '_converted.dxf')
+        doc.saveas(dxf_path)
+        return dxf_path
+        
+    except Exception as e:
+        try:
+            # Method 2: Try system dwg2dxf command (if installed)
+            import subprocess
+            dxf_path = dwg_path.replace('.dwg', '_converted.dxf').replace('.DWG', '_converted.dxf')
+            
+            result = subprocess.run(['dwg2dxf', dwg_path, dxf_path], 
+                                  capture_output=True, timeout=30)
+            
+            if os.path.exists(dxf_path):
+                return dxf_path
+        except:
+            pass
+    
+    return None
+
+def distance(p1, p2):
+    """Euclidean distance"""
+    return math.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2)
+
 def add_sh_labels_to_dxf(input_dxf, output_dxf, bathrooms, prefix="SH"):
     """Add SH text labels to DXF at bathroom centers"""
     doc = ezdxf.readfile(input_dxf)
@@ -227,7 +261,7 @@ tab1, tab2, tab3 = st.tabs(["📤 Upload & Process", "🎯 Review SH Marks", "�
 with tab1:
     st.markdown('<div class="step-box">Upload DXF → Auto detect → Mark SH → Generate BOQ</div>', unsafe_allow_html=True)
     
-    uploaded = st.file_uploader("Upload DXF Drawing", type=['dxf'])
+    uploaded = st.file_uploader("Upload DWG or DXF Drawing", type=['dxf', 'dwg'], accept_multiple_files=True)
     
     col1, col2 = st.columns(2)
     with col1:
@@ -236,44 +270,72 @@ with tab1:
         grid_size = st.number_input("Detection Radius (mm)", 1000, 10000, 5000, 500)
     
     if uploaded:
-        # Save uploaded file to temp directory
-        temp_dir = tempfile.gettempdir()
-        input_path = os.path.join(temp_dir, f"input_{uploaded.name}")
+        st.markdown(f"### 📁 Processing {len(uploaded)} file(s)")
         
-        with open(input_path, 'wb') as f:
-            f.write(uploaded.getvalue())
+        progress_bar = st.progress(0)
         
-        st.success(f"✅ {uploaded.name} uploaded ({uploaded.size / 1024:.1f} KB)")
-        
-        # Validate file format
-        file_content = uploaded.getvalue()
-        is_valid_dxf = file_content.startswith(b'999') or file_content.startswith(b'  0') or b'SECTION' in file_content
-        
-        if not is_valid_dxf and uploaded.name.lower().endswith('.dxf'):
-            st.warning("⚠️ File might be DWG, not DXF. Try converting in AutoCAD first.")
-        
-        if uploaded.name.lower().endswith('.dwg'):
-            st.error("❌ DWG format not supported. Must convert to DXF first:\n1. Open in AutoCAD\n2. File > Save As > DXF (2018)\n3. Upload DXF")
-        else:
-            if st.button("🔍 Detect & Mark Bathrooms", type="primary", use_container_width=True):
-                with st.spinner("Analyzing drawing..."):
-                    # Detect
-                    bathrooms = detect_bathrooms_spatial_clustering(input_path, grid_size)
+        for file_idx, uploaded_file in enumerate(uploaded):
+            progress = (file_idx + 1) / len(uploaded)
+            progress_bar.progress(progress)
+            
+            # Determine file type
+            is_dwg = uploaded_file.name.lower().endswith('.dwg')
+            
+            # Save uploaded file to temp directory
+            temp_dir = tempfile.gettempdir()
+            
+            if is_dwg:
+                input_path = os.path.join(temp_dir, f"input_{uploaded_file.name}")
+            else:
+                input_path = os.path.join(temp_dir, f"input_{uploaded_file.name}")
+            
+            with open(input_path, 'wb') as f:
+                f.write(uploaded_file.getvalue())
+            
+            st.info(f"**{uploaded_file.name}** ({uploaded_file.size / 1024:.1f} KB)")
+            
+            # Convert DWG to DXF if needed
+            if is_dwg:
+                st.write("🔄 Converting DWG to DXF...")
+                dxf_path = convert_dwg_to_dxf(input_path)
+                
+                if dxf_path:
+                    st.success("✅ DWG converted to DXF")
+                    process_path = dxf_path
+                else:
+                    st.error("❌ Could not convert DWG. Trying ezdxf direct read...")
+                    process_path = input_path
+            else:
+                process_path = input_path
+            
+            # Validate and process
+            file_content = uploaded_file.getvalue()
+            is_valid_dxf = file_content.startswith(b'999') or file_content.startswith(b'  0') or b'SECTION' in file_content
+            
+            if not is_valid_dxf and not is_dwg:
+                st.warning("⚠️ File might be corrupted. Attempting to process...")
+            
+            # Process file
+            if st.button(f"🔍 Detect & Mark {uploaded_file.name}", type="primary", use_container_width=True):
+                with st.spinner(f"Analyzing {uploaded_file.name}..."):
+                    bathrooms = detect_bathrooms_spatial_clustering(process_path, grid_size)
                     
                     if not bathrooms:
-                        st.error("❌ No bathrooms detected. Check DXF has WC/toilet blocks.")
+                        st.error(f"❌ No bathrooms detected in {uploaded_file.name}")
                     else:
-                        st.success(f"✅ Found {len(bathrooms)} bathrooms")
+                        st.success(f"✅ Found {len(bathrooms)} bathrooms in {uploaded_file.name}")
                         
                         # Mark DXF
                         temp_dir = tempfile.gettempdir()
-                        marked_path = os.path.join(temp_dir, f"marked_{uploaded.name}")
-                        bathrooms = add_sh_labels_to_dxf(input_path, marked_path, bathrooms, sh_prefix)
+                        marked_path = os.path.join(temp_dir, f"marked_{uploaded_file.name.replace('.dwg', '.dxf').replace('.DWG', '.dxf')}")
+                        bathrooms = add_sh_labels_to_dxf(process_path, marked_path, bathrooms, sh_prefix)
                         
                         st.session_state.bathrooms = bathrooms
                         st.session_state.marked_dxf_path = marked_path
                         
-                        st.success(f"✅ Added SH labels to drawing")
+                        st.success(f"✅ Added SH labels to {uploaded_file.name}")
+            
+            st.divider()
 
 with tab2:
     if st.session_state.bathrooms:
