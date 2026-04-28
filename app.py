@@ -60,14 +60,19 @@ def detect_bathrooms_spatial_clustering(dxf_path, grid_size=5000):
     try:
         for entity in msp.query('INSERT'):
             name = entity.dxf.name.lower()
+            # NEW FIX: Extract the layer name as well
+            layer = entity.dxf.layer.lower() if hasattr(entity.dxf, 'layer') else ""
+            
+            # Combine name and layer so we can search both at the same time
+            search_text = f"{name} {layer}"
             pos = (entity.dxf.insert.x, entity.dxf.insert.y)
             
-            # NOTE: If detection still fails, add your specific block names inside these brackets!
-            if re.search(r'(wc|toilet|closet|ewc)', name):
+            # Now searching both the block name AND the layer name
+            if re.search(r'(wc|toilet|closet|ewc|water)', search_text):
                 wc_blocks.append(pos)
-            elif re.search(r'(basin|sink|wash|lav)', name):
+            elif re.search(r'(basin|sink|wash|lav)', search_text):
                 basin_blocks.append(pos)
-            elif re.search(r'(drain|fd|gully)', name):
+            elif re.search(r'(drain|fd|gully|mft)', search_text):
                 drain_blocks.append(pos)
     except Exception as e:
         st.warning(f"Could not parse blocks: {str(e)[:50]}")
@@ -117,13 +122,11 @@ def detect_existing_sh_marks(dxf_path):
         msp = doc.modelspace()
         sh_marks = []
         
-        # Look for TEXT entities with SH pattern
         for entity in msp.query('TEXT MTEXT'):
             if hasattr(entity, 'dxf'):
                 try:
                     text_content = entity.dxf.text if hasattr(entity.dxf, 'text') else str(entity)
                     
-                    # FIXED REGEX: Now matches "SH-12" or "SH12"
                     match = re.search(r'SH-?(\d+)', text_content, re.IGNORECASE)
                     if match:
                         sh_num = match.group(1)
@@ -151,18 +154,20 @@ def extract_fixtures_from_sh(dxf_path, sh_marks):
         
         for entity in msp.query('INSERT'):
             name = entity.dxf.name.lower()
+            # NEW FIX: Extract layer name here too
+            layer = entity.dxf.layer.lower() if hasattr(entity.dxf, 'layer') else ""
+            search_text = f"{name} {layer}"
             pos = (entity.dxf.insert.x, entity.dxf.insert.y)
             
-            # NOTE: If detection still fails, add your specific block names inside these brackets!
-            if re.search(r'(wc|toilet|closet|ewc|water)', name):
+            if re.search(r'(wc|toilet|closet|ewc|water)', search_text):
                 wc_blocks.append(pos)
-            elif re.search(r'(basin|sink|wash|lav)', name):
+            elif re.search(r'(basin|sink|wash|lav)', search_text):
                 basin_blocks.append(pos)
-            elif re.search(r'(drain|fd|gully|mft)', name):
+            elif re.search(r'(drain|fd|gully|mft)', search_text):
                 drain_blocks.append(pos)
         
         bathrooms = []
-        radius = 3000  # Search radius around SH mark
+        radius = 3000  
         
         for sh_mark in sh_marks:
             sh_pos = sh_mark['position']
@@ -251,12 +256,13 @@ def inspect_and_show(dxf_path):
         block_display = info['block_names'][:30]
         blocks_text = "\n".join(block_display)
         st.code(blocks_text, language='')
-        
-        if len(info['block_names']) > 30:
-            st.info(f"... and {len(info['block_names']) - 30} more blocks")
-    else:
-        st.warning("⚠️ No blocks found in file")
     
+    if info['layer_names']:
+        st.markdown("**Layer Names Found (first 30):**")
+        layer_display = info['layer_names'][:30]
+        layers_text = "\n".join(layer_display)
+        st.code(layers_text, language='')
+        
     return info
 
 def add_sh_labels_to_dxf(input_dxf, output_dxf, bathrooms, prefix="SH"):
@@ -410,30 +416,15 @@ with tab1:
                             st.session_state.marked_dxf_path = process_path
                         else:
                             st.warning("⚠️ Could not extract fixtures from marks. Automatically inspecting file...")
-                            
-                            # Auto-inspect if fixtures are missing!
                             inspect_info = inspect_and_show(process_path)
-                            if inspect_info and 'block_names' in inspect_info:
-                                st.markdown("""
-                                ### 💡 Next Steps:
-                                Look at the **Block Names Found** above. Find the names of your WC and Basin blocks and share them here or add them to the regex logic in the code!
-                                """)
                     else:
                         st.info("No existing SH marks found. Running auto-detection...")
                         bathrooms = detect_bathrooms_spatial_clustering(process_path, grid_size)
                         
                         if not bathrooms:
                             st.error(f"❌ No bathrooms detected in {uploaded_file.name}")
-                            st.info("💡 Automatically inspecting the file to find your block names...")
-                            
-                            # AUTO-INSPECT HAPPENS HERE (No nested button)
+                            st.info("💡 Automatically inspecting the file to find your block and layer names...")
                             inspect_info = inspect_and_show(process_path)
-                            
-                            if inspect_info and 'block_names' in inspect_info:
-                                st.markdown("""
-                                ### 💡 Next Steps:
-                                Look at the **Block Names Found** above. Find the names of your WC and Basin blocks and share them here!
-                                """)
                         else:
                             st.success(f"✅ Found {len(bathrooms)} bathrooms in {uploaded_file.name}")
                             marked_path = os.path.join(temp_dir, f"marked_{uploaded_file.name.replace('.dwg', '.dxf').replace('.DWG', '.dxf')}")
