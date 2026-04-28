@@ -164,6 +164,83 @@ def convert_dwg_to_dxf_advanced(dwg_path):
     except:
         return None
 
+def inspect_dxf_contents(dxf_path):
+    """Inspect DXF file and show what's inside"""
+    try:
+        doc = ezdxf.readfile(dxf_path)
+        msp = doc.modelspace()
+        
+        # Get all entity types
+        entity_types = {}
+        block_names = set()
+        layer_names = set()
+        
+        for entity in msp:
+            etype = entity.dxftype()
+            entity_types[etype] = entity_types.get(etype, 0) + 1
+            
+            if etype == 'INSERT':
+                block_names.add(entity.dxf.name.lower())
+            
+            if hasattr(entity.dxf, 'layer'):
+                layer_names.add(entity.dxf.layer)
+        
+        return {
+            'entity_types': entity_types,
+            'block_names': sorted(list(block_names)),
+            'layer_names': sorted(list(layer_names)),
+            'total_entities': len(list(msp))
+        }
+    except Exception as e:
+        return {'error': str(e)}
+
+def inspect_and_show(dxf_path):
+    """Show DXF inspection results to user"""
+    info = inspect_dxf_contents(dxf_path)
+    
+    if 'error' in info:
+        st.error(f"Cannot inspect: {info['error']}")
+        return None
+    
+    st.markdown("### 🔍 DXF File Contents Analysis")
+    
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        st.metric("Total Entities", info['total_entities'])
+    with col2:
+        st.metric("Unique Blocks", len(info['block_names']))
+    with col3:
+        st.metric("Unique Layers", len(info['layer_names']))
+    
+    st.markdown("---")
+    
+    st.markdown("**Entity Types Found:**")
+    entity_col1, entity_col2 = st.columns(2)
+    with entity_col1:
+        for etype in sorted(info['entity_types'].keys())[:5]:
+            count = info['entity_types'][etype]
+            st.write(f"• {etype}: **{count}**")
+    with entity_col2:
+        for etype in sorted(info['entity_types'].keys())[5:]:
+            count = info['entity_types'][etype]
+            st.write(f"• {etype}: **{count}**")
+    
+    st.markdown("---")
+    
+    if info['block_names']:
+        st.markdown("**Block Names Found (first 30):**")
+        block_display = info['block_names'][:30]
+        blocks_text = "\n".join(block_display)
+        st.code(blocks_text, language='')
+        
+        if len(info['block_names']) > 30:
+            st.info(f"... and {len(info['block_names']) - 30} more blocks")
+    else:
+        st.warning("⚠️ No blocks found in file")
+    
+    return info
+
 def distance(p1, p2):
     """Euclidean distance"""
     return math.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2)
@@ -369,6 +446,26 @@ with tab1:
                     
                     if not bathrooms:
                         st.error(f"❌ No bathrooms detected in {uploaded_file.name}")
+                        
+                        # Show inspector
+                        st.info("💡 Let's check what's in this file...")
+                        if st.button(f"🔎 Inspect {uploaded_file.name}", use_container_width=True):
+                            inspect_info = inspect_and_show(process_path)
+                            
+                            if inspect_info and 'block_names' in inspect_info:
+                                st.markdown("""
+                                ### Next Steps:
+                                
+                                **Share the block names above with me.** They tell us what fixture symbols are in your drawing.
+                                
+                                **Common block names by CAD software:**
+                                - Revit: "Toilet", "Lavatory", "Sink", "Drain"
+                                - Civil3D: "WC", "BASIN", "FD_TRAP"
+                                - Huliot: "WC_110", "BASIN_50", "FD_MFT"
+                                - Generic: "TOILET", "SINK", "DRAIN"
+                                
+                                **Then I can update detection to find your blocks automatically.**
+                                """)
                     else:
                         st.success(f"✅ Found {len(bathrooms)} bathrooms in {uploaded_file.name}")
                         
