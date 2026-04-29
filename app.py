@@ -184,12 +184,13 @@ def render_dxf_to_image(dxf_path, dpi=150):
         return None
 
 def get_dxf_stats(dxf_path):
-    """Get basic stats from DXF file"""
+    """Get basic stats from DXF file - searches TEXT, MTEXT, INSERT, ATTRIB"""
     try:
         doc = ezdxf.readfile(dxf_path)
         msp = doc.modelspace()
         
         stats = {'entities': {}, 'layers': set(), 'blocks': set(), 'texts': []}
+        sh_candidates = []
         
         for entity in msp:
             etype = entity.dxftype()
@@ -198,28 +199,78 @@ def get_dxf_stats(dxf_path):
             if hasattr(entity.dxf, 'layer'):
                 stats['layers'].add(entity.dxf.layer)
             
-            if etype == 'INSERT':
-                try:
-                    stats['blocks'].add(entity.dxf.name)
-                except: pass
-            
+            # TEXT and MTEXT
             if etype in ('TEXT', 'MTEXT'):
                 try:
                     t = entity.dxf.text if hasattr(entity.dxf, 'text') else ''
                     if t.strip():
                         stats['texts'].append(t.strip())
+                        m = re.search(r'SH\s*-?\s*(\d+)', t, re.IGNORECASE)
+                        if m:
+                            pos = (entity.dxf.insert.x, entity.dxf.insert.y) if hasattr(entity.dxf, 'insert') else (0,0)
+                            sh_candidates.append({'sh': f"SH-{m.group(1)}", 'pos': pos, 'source': 'TEXT'})
+                except: pass
+            
+            # INSERT blocks - check block name AND attributes
+            if etype == 'INSERT':
+                try:
+                    bname = entity.dxf.name
+                    stats['blocks'].add(bname)
+                    pos = (entity.dxf.insert.x, entity.dxf.insert.y)
+                    
+                    # Check block name itself for SH pattern
+                    m = re.search(r'SH\s*-?\s*(\d+)', bname, re.IGNORECASE)
+                    if m:
+                        sh_candidates.append({'sh': f"SH-{m.group(1)}", 'pos': pos, 'source': 'BLOCK_NAME'})
+                    
+                    # Check ATTRIB entities inside block
+                    if entity.has_attribs:
+                        for attrib in entity.attribs:
+                            try:
+                                aval = attrib.dxf.text if hasattr(attrib.dxf, 'text') else ''
+                                atag = attrib.dxf.tag if hasattr(attrib.dxf, 'tag') else ''
+                                
+                                # Search value
+                                m = re.search(r'SH\s*-?\s*(\d+)', aval, re.IGNORECASE)
+                                if m:
+                                    sh_candidates.append({'sh': f"SH-{m.group(1)}", 'pos': pos, 'source': 'ATTRIB_VAL'})
+                                
+                                # Search tag
+                                m = re.search(r'SH\s*-?\s*(\d+)', atag, re.IGNORECASE)
+                                if m:
+                                    sh_candidates.append({'sh': f"SH-{m.group(1)}", 'pos': pos, 'source': 'ATTRIB_TAG'})
+                            except: pass
+                    
+                    # Check block definition content
+                    try:
+                        blk = doc.blocks.get(bname)
+                        if blk:
+                            for blk_entity in blk:
+                                if blk_entity.dxftype() in ('TEXT', 'MTEXT', 'ATTDEF'):
+                                    try:
+                                        bt = blk_entity.dxf.text if hasattr(blk_entity.dxf, 'text') else ''
+                                        m = re.search(r'SH\s*-?\s*(\d+)', bt, re.IGNORECASE)
+                                        if m:
+                                            sh_candidates.append({'sh': f"SH-{m.group(1)}", 'pos': pos, 'source': 'BLOCK_DEF'})
+                                    except: pass
+                    except: pass
+                    
                 except: pass
         
         stats['layers'] = sorted(list(stats['layers']))
         stats['blocks'] = sorted(list(stats['blocks']))
         
-        # Find SH marks in texts
-        sh_found = []
-        for t in stats['texts']:
-            m = re.search(r'SH\s*-?\s*(\d+)', t, re.IGNORECASE)
-            if m:
-                sh_found.append(f"SH-{m.group(1)}")
-        stats['sh_marks'] = sorted(list(set(sh_found)), key=lambda x: int(re.search(r'\d+', x).group()))
+        # Deduplicate SH marks
+        seen = set()
+        sh_marks = []
+        for c in sh_candidates:
+            if c['sh'] not in seen:
+                seen.add(c['sh'])
+                sh_marks.append(c)
+        
+        stats['sh_marks'] = sorted([s['sh'] for s in sh_marks], 
+                                    key=lambda x: int(re.search(r'\d+', x).group()))
+        stats['sh_positions'] = sh_marks
         
         return stats, doc
     except Exception as e:
@@ -491,8 +542,20 @@ with tab1:
             # SH marks found
             if stats['sh_marks']:
                 st.markdown(f'<span class="status-ok">✓ SH MARKS DETECTED: {" | ".join(stats["sh_marks"])}</span>', unsafe_allow_html=True)
+                
+                # Auto-populate sh_data for BOQ
+                if not st.session_state.sh_data:
+                    auto_sh = []
+                    for sh_id in stats['sh_marks']:
+                        auto_sh.append({
+                            'sh': sh_id,
+                            'type': 'Standard Toilet',
+                            'fixtures': {'WC': 1, 'Wash Basin': 1, 'Floor Drain': 1, 'Kitchen Sink': 0}
+                        })
+                    st.session_state.sh_data = auto_sh
+                    st.info(f"✅ {len(auto_sh)} shafts auto-loaded. Go to BOQ tab → adjust fixtures → generate BOQ.")
             else:
-                st.markdown('<span class="status-warn">⚠ No SH marks found in text entities. Use AI Analysis to identify shafts manually.</span>', unsafe_allow_html=True)
+                st.markdown('<span class="status-warn">⚠ SH blocks found (red circles) but text inside not readable as plain text. Use AI Analysis tab to detect shafts from drawing image.</span>', unsafe_allow_html=True)
             
             st.markdown("---")
             
