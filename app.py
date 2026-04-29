@@ -276,33 +276,33 @@ def get_dxf_stats(dxf_path):
     except Exception as e:
         return None, None
 
-def analyze_drawing_with_ai(image_bytes, project_context=""):
+def analyze_drawing_with_ai(image_bytes, api_key, project_context=""):
     """Use Claude Vision API to analyze the drawing"""
     try:
         image_b64 = base64.b64encode(image_bytes).decode('utf-8')
         
-        prompt = f"""You are an expert plumbing engineer analyzing a plumbing floor plan drawing.
+        prompt = f"""You are an expert plumbing engineer analyzing a plumbing drainage floor plan.
 
-Analyze this DXF/CAD drawing and identify:
+Look carefully at this drawing and find ALL shaft/bathroom labels. These are typically:
+- Red circles with text like "SH12", "SH13", "SH-01" inside
+- Shaft numbers next to toilet/bathroom areas
+- Labels near pipe stacks
 
-1. **Shaft/Bathroom Units**: Look for shaft labels (SH, SHAFT, S) and bathroom groupings
-2. **Fixtures per shaft**: Count WC/toilet, wash basin/sink, floor drain/FD, kitchen sink, shower
-3. **Drawing type**: Typical floor, ground floor, terrace, podium, etc.
-4. **Pipe sizes visible**: 110mm, 75mm, 50mm networks
-5. **Special observations**: Any unique plumbing configurations
-
-For each shaft found, estimate fixture count based on visible symbols.
+For EACH shaft found:
+1. Read the exact SH number (SH12, SH13, SH14, etc.)
+2. Look at nearby fixtures - count WC (toilet pan), wash basin, floor drain
+3. Note bathroom type
 
 {f"Project context: {project_context}" if project_context else ""}
 
-Return ONLY valid JSON:
+Return ONLY valid JSON - no extra text:
 {{
   "drawing_type": "Typical Floor Plan",
   "total_shafts": 0,
   "shafts": [
     {{
-      "id": "SH-01",
-      "bathroom_type": "Standard Toilet / Master Bathroom / Powder Room / Kitchen",
+      "id": "SH-12",
+      "bathroom_type": "Standard Toilet",
       "fixtures": {{
         "WC": 1,
         "Wash Basin": 1,
@@ -310,50 +310,52 @@ Return ONLY valid JSON:
         "Kitchen Sink": 0,
         "Shower": 0
       }},
-      "notes": "Any special observations"
+      "notes": ""
     }}
   ],
-  "observations": "Overall drawing observations",
-  "confidence": "High/Medium/Low",
-  "pipe_sizes_visible": ["110mm", "50mm"]
+  "observations": "Brief description of drawing",
+  "confidence": "High"
 }}"""
 
-        payload = {
-            "model": "claude-sonnet-4-20250514",
-            "max_tokens": 2000,
-            "messages": [{
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "image/png",
-                            "data": image_b64
-                        }
-                    },
-                    {"type": "text", "text": prompt}
-                ]
-            }]
-        }
-        
         response = requests.post(
             "https://api.anthropic.com/v1/messages",
-            headers={"Content-Type": "application/json"},
-            json=payload,
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01"
+            },
+            json={
+                "model": "claude-opus-4-5",
+                "max_tokens": 2000,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": image_b64
+                            }
+                        },
+                        {"type": "text", "text": prompt}
+                    ]
+                }]
+            },
             timeout=60
         )
         
         if response.status_code == 200:
             data = response.json()
             text = data['content'][0]['text']
-            
-            # Parse JSON
             text = re.sub(r'```json|```', '', text).strip()
             return json.loads(text)
         else:
+            err = response.json()
+            st.error(f"API Error {response.status_code}: {err.get('error', {}).get('message', 'Unknown')}")
             return None
     except Exception as e:
+        st.error(f"AI Analysis error: {str(e)}")
         return None
 
 def generate_boq_excel(sh_data, project_name="Huliot Project"):
@@ -470,6 +472,20 @@ with st.sidebar:
     project_name = st.text_input("Project Name", "Huliot Project")
     consultant = st.text_input("Consultant", "")
     floors = st.number_input("Total Floors", 1, 50, 1)
+    
+    st.markdown("---")
+    st.markdown('<div class="section-title">AI SETTINGS</div>', unsafe_allow_html=True)
+    
+    api_key = st.text_input(
+        "Anthropic API Key",
+        type="password",
+        placeholder="sk-ant-...",
+        help="Get from console.anthropic.com"
+    )
+    if api_key:
+        st.markdown('<span style="color:#00ff88; font-size:0.8rem;">✓ API Key set</span>', unsafe_allow_html=True)
+    else:
+        st.markdown('<span style="color:#ffaa00; font-size:0.8rem;">⚠ Add key for AI analysis</span>', unsafe_allow_html=True)
     
     st.markdown("---")
     st.markdown('<div class="section-title">SETTINGS</div>', unsafe_allow_html=True)
@@ -615,8 +631,12 @@ with tab2:
             manual_btn = st.button("✏️ Enter Shafts Manually", use_container_width=True)
         
         if analyze_btn:
-            with st.spinner("AI analyzing drawing..."):
-                result = analyze_drawing_with_ai(st.session_state.drawing_image, context)
+            if not api_key:
+                st.error("❌ Add your Anthropic API key in the sidebar first.")
+                st.info("Get free API key at: https://console.anthropic.com")
+            else:
+                with st.spinner("AI reading drawing image... (30-60 sec)"):
+                    result = analyze_drawing_with_ai(st.session_state.drawing_image, api_key, context)
             
             if result:
                 st.session_state.analysis_done = True
