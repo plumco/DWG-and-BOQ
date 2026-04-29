@@ -4,3 +4,5 @@ ezdxf>=1.4.3
 openpyxl>=3.1.0
 numpy>=1.24.0
 matplotlib>=3.7.0
+requests>=2.28.0
+Pillow>=9.0.0
