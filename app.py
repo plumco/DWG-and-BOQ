@@ -154,23 +154,24 @@ for k, v in {
 
 # ─── FUNCTIONS ───────────────────────────────────────────────────
 
-def render_dxf_to_image(dxf_path, dpi=150):
-    """Render DXF to PNG image using ezdxf + matplotlib"""
+def render_dxf_to_image(dxf_path, dpi=72):
+    """Render DXF to PNG - with fallbacks for large files"""
     try:
         doc = ezdxf.readfile(dxf_path)
         msp = doc.modelspace()
         
-        fig = plt.figure(figsize=(16, 10), facecolor='#0a0d13')
+        # Try low-res first for large files
+        fig = plt.figure(figsize=(14, 9), facecolor='#0a0d13')
         ax = fig.add_axes([0, 0, 1, 1], facecolor='#0a0d13')
         
         ctx = RenderContext(doc)
         backend = MatplotlibBackend(ax)
         frontend = Frontend(ctx, backend)
+        
+        # Limit rendering for large files
         frontend.draw_layout(msp, finalize=True)
         
-        # Style the axes
         ax.set_facecolor('#0a0d13')
-        ax.tick_params(colors='#8a8a7a')
         for spine in ax.spines.values():
             spine.set_edgecolor('#1a5f3c')
         
@@ -180,7 +181,11 @@ def render_dxf_to_image(dxf_path, dpi=150):
         plt.close(fig)
         buf.seek(0)
         return buf.getvalue()
+    except MemoryError:
+        plt.close('all')
+        return None
     except Exception as e:
+        plt.close('all')
         return None
 
 def get_dxf_stats(dxf_path):
@@ -585,7 +590,29 @@ with tab1:
                 st.session_state.drawing_image = img_bytes
                 st.image(img_bytes, use_container_width=True, caption=f"{uploaded.name}")
             else:
-                st.warning("Could not render drawing. File may be too complex.")
+                st.warning("⚠️ Drawing too large/complex to auto-render.")
+                st.markdown("""
+                <div style="background:#1a1200; border:1px solid #ffaa00; border-radius:8px; padding:1rem; margin:1rem 0;">
+                    <b style="color:#ffaa00;">📸 Upload a Screenshot Instead</b><br>
+                    <span style="color:#b0a070; font-size:0.85rem; font-family:'IBM Plex Mono',monospace;">
+                    1. Open DXF in AutoCAD / DWG TrueView<br>
+                    2. Press Print Screen or Snipping Tool<br>
+                    3. Upload screenshot below<br>
+                    4. AI will read SH marks from image
+                    </span>
+                </div>
+                """, unsafe_allow_html=True)
+                
+                screenshot = st.file_uploader(
+                    "Upload Drawing Screenshot",
+                    type=['png', 'jpg', 'jpeg'],
+                    key="screenshot_upload"
+                )
+                if screenshot:
+                    img_bytes = screenshot.getvalue()
+                    st.session_state.drawing_image = img_bytes
+                    st.image(img_bytes, use_container_width=True, caption="Screenshot uploaded")
+                    st.success("✅ Screenshot ready. Go to 🤖 AI ANALYSIS tab.")
             
             # Layer info
             with st.expander("📋 Layers & Blocks"):
@@ -614,11 +641,34 @@ with tab1:
 with tab2:
     st.markdown('<div class="section-title">AI DRAWING ANALYSIS</div>', unsafe_allow_html=True)
     
-    if not st.session_state.drawing_image:
-        st.info("Upload and render a DXF first in the VIEWER tab.")
+    # Allow direct image upload here too
+    ai_image = None
+    
+    if st.session_state.drawing_image:
+        ai_image = st.session_state.drawing_image
+        st.image(ai_image, use_container_width=True, caption="Drawing for AI analysis")
     else:
-        st.image(st.session_state.drawing_image, use_container_width=True)
+        st.markdown("""
+        <div style="background:#0d1a12; border:1px solid #1a5f3c; border-radius:8px; padding:1.5rem; margin-bottom:1rem;">
+            <b style="color:#00ff88; font-family:'Bebas Neue',sans-serif; font-size:1.3rem;">UPLOAD DRAWING IMAGE DIRECTLY</b><br>
+            <span style="color:#8a8a7a; font-size:0.82rem; font-family:'IBM Plex Mono',monospace;">
+            No DXF needed. Take a screenshot of your drawing and upload here.<br>
+            AI will read SH marks visually from the image.
+            </span>
+        </div>
+        """, unsafe_allow_html=True)
         
+        direct_img = st.file_uploader(
+            "Upload Drawing Screenshot / Image",
+            type=['png', 'jpg', 'jpeg'],
+            key="ai_direct_image"
+        )
+        if direct_img:
+            ai_image = direct_img.getvalue()
+            st.session_state.drawing_image = ai_image
+            st.image(ai_image, use_container_width=True, caption="Uploaded for AI analysis")
+    
+    if ai_image:
         context = st.text_input(
             "Project context (optional)",
             placeholder="e.g. Residential tower, typical floor, 4 bathrooms per floor"
@@ -635,8 +685,8 @@ with tab2:
                 st.error("❌ Add your Anthropic API key in the sidebar first.")
                 st.info("Get free API key at: https://console.anthropic.com")
             else:
-                with st.spinner("AI reading drawing image... (30-60 sec)"):
-                    result = analyze_drawing_with_ai(st.session_state.drawing_image, api_key, context)
+                with st.spinner("AI reading SH marks from drawing image... (30-60 sec)"):
+                    result = analyze_drawing_with_ai(ai_image, api_key, context)
             
             if result:
                 st.session_state.analysis_done = True
