@@ -1,897 +1,576 @@
 """
-Huliot Drawing Intelligence Platform
-DXF Viewer + AI Analysis + BOQ Generator
+Huliot PPT Report Formatter — Phase 1
+Applies master template formatting to team-submitted site visit reports.
 """
 
 import streamlit as st
-import pandas as pd
-import ezdxf
-from ezdxf.addons.drawing import RenderContext, Frontend
-from ezdxf.addons.drawing.matplotlib import MatplotlibBackend
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-import io, os, re, math, base64, json, tempfile
-import requests
-from io import BytesIO
+from pptx import Presentation
+from pptx.util import Pt, Emu
+from pptx.dml.color import RGBColor
+from pptx.enum.text import PP_ALIGN
+from pptx.oxml.ns import qn
+from lxml import etree
+import io
+import copy
+import json
+from datetime import datetime
 
-# ─── PAGE CONFIG ────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# PAGE CONFIG
+# ─────────────────────────────────────────────────────────────────────────────
+
 st.set_page_config(
-    page_title="Huliot DIP",
-    page_icon="🏗️",
+    page_title="Huliot Report Formatter",
+    page_icon="🔧",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
-# ─── STYLES ─────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# CUSTOM CSS
+# ─────────────────────────────────────────────────────────────────────────────
+
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Bebas+Neue&family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@300;400;600;700&display=swap');
+    .main-header {
+        background: linear-gradient(135deg, #1a5c38 0%, #2d8a56 100%);
+        padding: 1.5rem 2rem;
+        border-radius: 12px;
+        margin-bottom: 1.5rem;
+        color: white;
+    }
+    .main-header h1 { color: white; margin: 0; font-size: 1.8rem; }
+    .main-header p  { color: #c8f0d8; margin: 0.3rem 0 0 0; font-size: 0.95rem; }
 
-html, body, .stApp { background:#0a0d13; color:#e8e8e0; font-family:'IBM Plex Sans', sans-serif; }
-
-h1,h2,h3 { font-family:'Bebas Neue', sans-serif; letter-spacing:0.05em; }
-
-.hero {
-    background: linear-gradient(135deg, #0d2818 0%, #0a1a0a 50%, #0d1a2a 100%);
-    border: 1px solid #1a5f3c;
-    border-radius: 12px;
-    padding: 2.5rem;
-    margin-bottom: 2rem;
-    position: relative;
-    overflow: hidden;
-}
-.hero::before {
-    content: '';
-    position: absolute;
-    top: -50%;
-    left: -50%;
-    width: 200%;
-    height: 200%;
-    background: radial-gradient(ellipse at center, rgba(26,95,60,0.15) 0%, transparent 60%);
-    pointer-events: none;
-}
-.hero h1 { font-size:3.5rem; color:#00ff88; margin:0; line-height:1; }
-.hero p { color:#8a8a7a; font-family:'IBM Plex Mono', monospace; font-size:0.85rem; margin-top:0.5rem; }
-
-.stat-card {
-    background: #0d1a12;
-    border: 1px solid #1a5f3c;
-    border-radius: 8px;
-    padding: 1.2rem;
-    text-align: center;
-    transition: border-color 0.2s;
-}
-.stat-card:hover { border-color: #00ff88; }
-.stat-card .val { font-size:2rem; font-weight:700; color:#00ff88; font-family:'Bebas Neue', sans-serif; }
-.stat-card .lbl { font-size:0.7rem; color:#8a8a7a; text-transform:uppercase; letter-spacing:0.1em; margin-top:0.2rem; font-family:'IBM Plex Mono', monospace; }
-
-.sh-card {
-    background: #0d1a12;
-    border: 1px solid #1a4a2a;
-    border-left: 4px solid #00ff88;
-    border-radius: 6px;
-    padding: 1rem;
-    margin-bottom: 0.8rem;
-}
-.sh-card .sh-label { font-family:'Bebas Neue', sans-serif; font-size:1.8rem; color:#00ff88; line-height:1; }
-.sh-card .sh-type { font-family:'IBM Plex Mono', monospace; font-size:0.72rem; color:#8a8a7a; text-transform:uppercase; margin-bottom:0.5rem; }
-.sh-card .fixture-row { display:flex; gap:1rem; margin-top:0.5rem; }
-.sh-card .fix-item { background:#0a1409; border:1px solid #1a3a1a; border-radius:4px; padding:0.3rem 0.6rem; font-size:0.75rem; color:#b0c0b0; font-family:'IBM Plex Mono', monospace; }
-
-.boq-header { background:#1a5f3c; color:white; padding:0.8rem 1rem; border-radius:6px 6px 0 0; font-family:'Bebas Neue', sans-serif; font-size:1.4rem; letter-spacing:0.1em; }
-
-.status-ok { color:#00ff88; font-weight:600; }
-.status-err { color:#ff4444; }
-.status-warn { color:#ffaa00; }
-
-.upload-zone {
-    border: 2px dashed #1a5f3c;
-    border-radius: 10px;
-    padding: 3rem;
-    text-align: center;
-    background: #0d1a12;
-    transition: all 0.2s;
-}
-
-.section-title {
-    font-family: 'Bebas Neue', sans-serif;
-    font-size: 1.6rem;
-    color: #00ff88;
-    letter-spacing: 0.08em;
-    border-bottom: 1px solid #1a5f3c;
-    padding-bottom: 0.5rem;
-    margin-bottom: 1rem;
-}
-
-/* Streamlit overrides */
-.stButton > button {
-    background: #1a5f3c !important;
-    color: white !important;
-    border: none !important;
-    border-radius: 6px !important;
-    font-family: 'IBM Plex Mono', monospace !important;
-    font-weight: 600 !important;
-    letter-spacing: 0.05em !important;
-    transition: all 0.2s !important;
-}
-.stButton > button:hover {
-    background: #00ff88 !important;
-    color: #0a0d13 !important;
-}
-.stTabs [data-baseweb="tab"] {
-    font-family: 'IBM Plex Mono', monospace !important;
-    font-size: 0.82rem !important;
-    color: #8a8a7a !important;
-}
-.stTabs [aria-selected="true"] {
-    color: #00ff88 !important;
-    border-bottom-color: #00ff88 !important;
-}
-.stNumberInput > div > div > input,
-.stTextInput > div > div > input {
-    background: #0d1a12 !important;
-    border: 1px solid #1a5f3c !important;
-    color: #e8e8e0 !important;
-    border-radius: 4px !important;
-}
-div[data-testid="stDataFrame"] { border: 1px solid #1a5f3c; border-radius: 6px; overflow: hidden; }
+    .step-card {
+        background: #f8fffe;
+        border: 1.5px solid #2d8a56;
+        border-radius: 10px;
+        padding: 1.2rem 1.4rem;
+        margin-bottom: 1rem;
+    }
+    .step-number {
+        background: #2d8a56;
+        color: white;
+        border-radius: 50%;
+        width: 28px; height: 28px;
+        display: inline-flex;
+        align-items: center; justify-content: center;
+        font-weight: bold; font-size: 0.85rem;
+        margin-right: 0.5rem;
+    }
+    .status-box {
+        background: #e8f5e9;
+        border-left: 4px solid #2d8a56;
+        padding: 0.8rem 1rem;
+        border-radius: 4px;
+        margin: 0.5rem 0;
+        font-size: 0.88rem;
+    }
+    .warn-box {
+        background: #fff3e0;
+        border-left: 4px solid #f57c00;
+        padding: 0.8rem 1rem;
+        border-radius: 4px;
+        margin: 0.5rem 0;
+        font-size: 0.88rem;
+    }
+    .metric-row { display: flex; gap: 1rem; margin: 0.8rem 0; }
+    .metric-box {
+        flex: 1;
+        background: white;
+        border: 1px solid #e0e0e0;
+        border-radius: 8px;
+        padding: 0.8rem;
+        text-align: center;
+    }
+    .metric-box .val { font-size: 1.6rem; font-weight: bold; color: #1a5c38; }
+    .metric-box .lbl { font-size: 0.75rem; color: #666; }
+    div[data-testid="stFileUploader"] { border: 2px dashed #2d8a56 !important; border-radius: 10px; }
+    .stButton > button {
+        background: #1a5c38;
+        color: white;
+        border: none;
+        border-radius: 8px;
+        padding: 0.6rem 2rem;
+        font-size: 1rem;
+        font-weight: 600;
+        width: 100%;
+    }
+    .stButton > button:hover { background: #2d8a56; }
 </style>
 """, unsafe_allow_html=True)
 
-# ─── SESSION STATE ───────────────────────────────────────────────
-for k, v in {
-    'dxf_doc': None,
-    'dxf_path': None,
-    'drawing_image': None,
-    'sh_data': [],
-    'boq_df': None,
-    'analysis_done': False
-}.items():
-    if k not in st.session_state:
-        st.session_state[k] = v
+# ─────────────────────────────────────────────────────────────────────────────
+# SLIDE CLASSIFICATION
+# ─────────────────────────────────────────────────────────────────────────────
 
-# ─── FUNCTIONS ───────────────────────────────────────────────────
+def classify_slide(index: int, total: int) -> str:
+    """Classify slide as cover | content | closing."""
+    if index == 0:
+        return "cover"
+    if index == total - 1:
+        return "closing"
+    return "content"
 
-def render_dxf_to_image(dxf_path, dpi=72):
-    """Render DXF to PNG - with fallbacks for large files"""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TEMPLATE PROFILE EXTRACTION
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _safe_rgb(font):
     try:
-        doc = ezdxf.readfile(dxf_path)
-        msp = doc.modelspace()
-        
-        # Try low-res first for large files
-        fig = plt.figure(figsize=(14, 9), facecolor='#0a0d13')
-        ax = fig.add_axes([0, 0, 1, 1], facecolor='#0a0d13')
-        
-        ctx = RenderContext(doc)
-        backend = MatplotlibBackend(ax)
-        frontend = Frontend(ctx, backend)
-        
-        # Limit rendering for large files
-        frontend.draw_layout(msp, finalize=True)
-        
-        ax.set_facecolor('#0a0d13')
-        for spine in ax.spines.values():
-            spine.set_edgecolor('#1a5f3c')
-        
-        buf = io.BytesIO()
-        fig.savefig(buf, format='png', dpi=dpi, bbox_inches='tight',
-                   facecolor='#0a0d13', edgecolor='none')
-        plt.close(fig)
-        buf.seek(0)
-        return buf.getvalue()
-    except MemoryError:
-        plt.close('all')
-        return None
-    except Exception as e:
-        plt.close('all')
-        return None
+        if font.color and font.color.type:
+            return font.color.rgb
+    except Exception:
+        pass
+    return None
 
-def get_dxf_stats(dxf_path):
-    """Get basic stats from DXF file - searches TEXT, MTEXT, INSERT, ATTRIB"""
+
+def extract_text_profile(slide):
+    """
+    Returns list of shape profiles with font info for every text shape.
+    Shapes are tagged by their rough role (title / body / footer).
+    """
+    profiles = []
+    for shape in slide.shapes:
+        if not shape.has_text_frame:
+            continue
+        role = _guess_shape_role(shape, slide)
+        for para in shape.text_frame.paragraphs:
+            for run in para.runs:
+                if not run.text.strip():
+                    continue
+                f = run.font
+                profiles.append({
+                    "role": role,
+                    "name": f.name,
+                    "size": f.size,
+                    "bold": f.bold,
+                    "italic": f.italic,
+                    "color": _safe_rgb(f),
+                    "alignment": para.alignment,
+                    "space_before": para.space_before,
+                    "space_after": para.space_after,
+                    "line_spacing": para.line_spacing,
+                })
+    return profiles
+
+
+def _guess_shape_role(shape, slide) -> str:
+    """Heuristically guess title / footer / body."""
+    name_lower = shape.name.lower()
+    if "title" in name_lower:
+        return "title"
+    if "footer" in name_lower or "date" in name_lower or "slide number" in name_lower:
+        return "footer"
+    # positional: if top is in bottom 15% of slide height → footer
     try:
-        doc = ezdxf.readfile(dxf_path)
-        msp = doc.modelspace()
-        
-        stats = {'entities': {}, 'layers': set(), 'blocks': set(), 'texts': []}
-        sh_candidates = []
-        
-        for entity in msp:
-            etype = entity.dxftype()
-            stats['entities'][etype] = stats['entities'].get(etype, 0) + 1
-            
-            if hasattr(entity.dxf, 'layer'):
-                stats['layers'].add(entity.dxf.layer)
-            
-            # TEXT and MTEXT
-            if etype in ('TEXT', 'MTEXT'):
-                try:
-                    t = entity.dxf.text if hasattr(entity.dxf, 'text') else ''
-                    if t.strip():
-                        stats['texts'].append(t.strip())
-                        m = re.search(r'SH\s*-?\s*(\d+)', t, re.IGNORECASE)
-                        if m:
-                            pos = (entity.dxf.insert.x, entity.dxf.insert.y) if hasattr(entity.dxf, 'insert') else (0,0)
-                            sh_candidates.append({'sh': f"SH-{m.group(1)}", 'pos': pos, 'source': 'TEXT'})
-                except: pass
-            
-            # INSERT blocks - check block name AND attributes
-            if etype == 'INSERT':
-                try:
-                    bname = entity.dxf.name
-                    stats['blocks'].add(bname)
-                    pos = (entity.dxf.insert.x, entity.dxf.insert.y)
-                    
-                    # Check block name itself for SH pattern
-                    m = re.search(r'SH\s*-?\s*(\d+)', bname, re.IGNORECASE)
-                    if m:
-                        sh_candidates.append({'sh': f"SH-{m.group(1)}", 'pos': pos, 'source': 'BLOCK_NAME'})
-                    
-                    # Check ATTRIB entities inside block
-                    if entity.has_attribs:
-                        for attrib in entity.attribs:
-                            try:
-                                aval = attrib.dxf.text if hasattr(attrib.dxf, 'text') else ''
-                                atag = attrib.dxf.tag if hasattr(attrib.dxf, 'tag') else ''
-                                
-                                # Search value
-                                m = re.search(r'SH\s*-?\s*(\d+)', aval, re.IGNORECASE)
-                                if m:
-                                    sh_candidates.append({'sh': f"SH-{m.group(1)}", 'pos': pos, 'source': 'ATTRIB_VAL'})
-                                
-                                # Search tag
-                                m = re.search(r'SH\s*-?\s*(\d+)', atag, re.IGNORECASE)
-                                if m:
-                                    sh_candidates.append({'sh': f"SH-{m.group(1)}", 'pos': pos, 'source': 'ATTRIB_TAG'})
-                            except: pass
-                    
-                    # Check block definition content
-                    try:
-                        blk = doc.blocks.get(bname)
-                        if blk:
-                            for blk_entity in blk:
-                                if blk_entity.dxftype() in ('TEXT', 'MTEXT', 'ATTDEF'):
-                                    try:
-                                        bt = blk_entity.dxf.text if hasattr(blk_entity.dxf, 'text') else ''
-                                        m = re.search(r'SH\s*-?\s*(\d+)', bt, re.IGNORECASE)
-                                        if m:
-                                            sh_candidates.append({'sh': f"SH-{m.group(1)}", 'pos': pos, 'source': 'BLOCK_DEF'})
-                                    except: pass
-                    except: pass
-                    
-                except: pass
-        
-        stats['layers'] = sorted(list(stats['layers']))
-        stats['blocks'] = sorted(list(stats['blocks']))
-        
-        # Deduplicate SH marks
-        seen = set()
-        sh_marks = []
-        for c in sh_candidates:
-            if c['sh'] not in seen:
-                seen.add(c['sh'])
-                sh_marks.append(c)
-        
-        stats['sh_marks'] = sorted([s['sh'] for s in sh_marks], 
-                                    key=lambda x: int(re.search(r'\d+', x).group()))
-        stats['sh_positions'] = sh_marks
-        
-        return stats, doc
-    except Exception as e:
-        return None, None
+        slide_h = slide.part.slide_layout.slide_master.slide_height or Emu(6858000)
+    except Exception:
+        slide_h = Emu(6858000)  # standard 19.05 cm
+    if shape.top and shape.top > slide_h * 0.82:
+        return "footer"
+    if shape.top and shape.top < slide_h * 0.25:
+        return "title"
+    return "body"
 
-def analyze_drawing_with_ai(image_bytes, api_key, project_context=""):
-    """Use Claude Vision API to analyze the drawing"""
-    try:
-        image_b64 = base64.b64encode(image_bytes).decode('utf-8')
-        
-        prompt = f"""You are an expert plumbing engineer analyzing a plumbing drainage floor plan.
 
-Look carefully at this drawing and find ALL shaft/bathroom labels. These are typically:
-- Red circles with text like "SH12", "SH13", "SH-01" inside
-- Shaft numbers next to toilet/bathroom areas
-- Labels near pipe stacks
+def extract_image_profile(slide):
+    """Extract all image bounding boxes from a slide."""
+    imgs = []
+    for shape in slide.shapes:
+        if shape.shape_type == 13:  # MSO_SHAPE_TYPE.PICTURE
+            imgs.append({
+                "left": shape.left,
+                "top": shape.top,
+                "width": shape.width,
+                "height": shape.height,
+            })
+    return imgs
 
-For EACH shaft found:
-1. Read the exact SH number (SH12, SH13, SH14, etc.)
-2. Look at nearby fixtures - count WC (toilet pan), wash basin, floor drain
-3. Note bathroom type
 
-{f"Project context: {project_context}" if project_context else ""}
+def build_template_profile(prs: Presentation) -> dict:
+    """
+    Build a full profile dict from the template:
+      { 'cover': {...}, 'content': {...}, 'closing': {...} }
+    Each entry has 'fonts' (by role) and 'images' (list of boxes).
+    """
+    slides = list(prs.slides)
+    total = len(slides)
+    profile = {}
 
-Return ONLY valid JSON - no extra text:
-{{
-  "drawing_type": "Typical Floor Plan",
-  "total_shafts": 0,
-  "shafts": [
-    {{
-      "id": "SH-12",
-      "bathroom_type": "Standard Toilet",
-      "fixtures": {{
-        "WC": 1,
-        "Wash Basin": 1,
-        "Floor Drain": 1,
-        "Kitchen Sink": 0,
-        "Shower": 0
-      }},
-      "notes": ""
-    }}
-  ],
-  "observations": "Brief description of drawing",
-  "confidence": "High"
-}}"""
+    for idx, slide in enumerate(slides):
+        stype = classify_slide(idx, total)
+        if stype in profile:
+            continue  # first occurrence wins
 
-        response = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "Content-Type": "application/json",
-                "x-api-key": api_key,
-                "anthropic-version": "2023-06-01"
-            },
-            json={
-                "model": "claude-opus-4-5",
-                "max_tokens": 2000,
-                "messages": [{
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": "image/png",
-                                "data": image_b64
-                            }
-                        },
-                        {"type": "text", "text": prompt}
-                    ]
-                }]
-            },
-            timeout=60
-        )
-        
-        if response.status_code == 200:
-            data = response.json()
-            text = data['content'][0]['text']
-            text = re.sub(r'```json|```', '', text).strip()
-            return json.loads(text)
-        else:
-            err = response.json()
-            st.error(f"API Error {response.status_code}: {err.get('error', {}).get('message', 'Unknown')}")
-            return None
-    except Exception as e:
-        st.error(f"AI Analysis error: {str(e)}")
-        return None
+        text_profiles = extract_text_profile(slide)
+        # Aggregate: per role, take the first non-None value
+        fonts_by_role = {}
+        for tp in text_profiles:
+            r = tp["role"]
+            if r not in fonts_by_role:
+                fonts_by_role[r] = {k: tp[k] for k in ("name", "size", "bold", "italic", "color", "alignment", "space_before", "space_after", "line_spacing")}
 
-def generate_boq_excel(sh_data, project_name="Huliot Project"):
-    """Generate complete BOQ Excel from shaft data"""
-    
-    # Material database per fixture unit
-    materials = [
-        # 110mm WC system
-        {'fixture': 'WC', 'desc': 'Huliot DIA.110mm L-3000mm Single Socket Pipe', 'unit': 'MTR', 'qty_per': 14.15, 'sku': '5751100300-i', 'price': 2461},
-        {'fixture': 'WC', 'desc': 'Huliot DIA.110mm L-500mm Single Socket Pipe', 'unit': 'NOS.', 'qty_per': 2, 'sku': '5751100050-i', 'price': 452},
-        {'fixture': 'WC', 'desc': 'Huliot DIA.110mm Socket', 'unit': 'NOS.', 'qty_per': 22, 'sku': '7071740275', 'price': 533},
-        {'fixture': 'WC', 'desc': 'Huliot DIA.110mm 90 Bend', 'unit': 'NOS.', 'qty_per': 15, 'sku': '7070040870-i', 'price': 581},
-        {'fixture': 'WC', 'desc': 'Huliot DIA.110mm 45 Bend', 'unit': 'NOS.', 'qty_per': 11, 'sku': '7070040470-i', 'price': 534},
-        {'fixture': 'WC', 'desc': 'Huliot DIA.110mm Equal Tee', 'unit': 'NOS.', 'qty_per': 4, 'sku': '7071740675-i', 'price': 727},
-        {'fixture': 'WC', 'desc': 'Huliot Dia.110mm Clamps (Fixed)', 'unit': 'NOS.', 'qty_per': 12, 'sku': '8011100', 'price': 234},
-        {'fixture': 'WC', 'desc': 'Huliot Dia.110mm Clamps (Sliding)', 'unit': 'NOS.', 'qty_per': 6, 'sku': '8011101', 'price': 218},
-        # 50mm Basin system
-        {'fixture': 'Wash Basin', 'desc': 'Huliot DIA.50mm L-1000mm Single Socket Pipe', 'unit': 'MTR', 'qty_per': 5.8, 'sku': '5755000100-i', 'price': 390},
-        {'fixture': 'Wash Basin', 'desc': 'Huliot DIA.50mm Socket', 'unit': 'NOS.', 'qty_per': 3, 'sku': '7071720275', 'price': 162},
-        {'fixture': 'Wash Basin', 'desc': 'Huliot DIA.50mm 90 Bend', 'unit': 'NOS.', 'qty_per': 10, 'sku': '7070020870-i', 'price': 119},
-        {'fixture': 'Wash Basin', 'desc': 'Huliot DIA.50mm 45 Bend', 'unit': 'NOS.', 'qty_per': 2, 'sku': '7070020470-i', 'price': 97},
-        {'fixture': 'Wash Basin', 'desc': 'Huliot Dia.50mm Clamps (Fixed)', 'unit': 'NOS.', 'qty_per': 5, 'sku': '8010500', 'price': 118},
-        {'fixture': 'Wash Basin', 'desc': 'Huliot Dia.50mm Clamps (Sliding)', 'unit': 'NOS.', 'qty_per': 2, 'sku': '8010501', 'price': 104},
-        # 75mm Floor Drain system
-        {'fixture': 'Floor Drain', 'desc': 'Huliot Floor Drain (Multi Floor Trap)', 'unit': 'NOS.', 'qty_per': 1, 'sku': '60117060', 'price': 1247},
-        {'fixture': 'Floor Drain', 'desc': 'Huliot Floor Drain 150mm Height Riser', 'unit': 'NOS.', 'qty_per': 1, 'sku': '69201551 B-i', 'price': 542},
-        {'fixture': 'Floor Drain', 'desc': 'Huliot DIA.75mm L-1000mm Single Socket Pipe', 'unit': 'MTR', 'qty_per': 3.0, 'sku': '5757500100-i', 'price': 620},
-        {'fixture': 'Floor Drain', 'desc': 'Huliot DIA.75mm 90 Bend', 'unit': 'NOS.', 'qty_per': 2, 'sku': '7070030870-i', 'price': 284},
-        # Kitchen Sink
-        {'fixture': 'Kitchen Sink', 'desc': 'Huliot DIA.50mm L-1000mm Single Socket Pipe', 'unit': 'MTR', 'qty_per': 3.5, 'sku': '5755000100-i', 'price': 390},
-        {'fixture': 'Kitchen Sink', 'desc': 'Huliot DIA.50mm 90 Bend', 'unit': 'NOS.', 'qty_per': 4, 'sku': '7070020870-i', 'price': 119},
-        {'fixture': 'Kitchen Sink', 'desc': 'Huliot Dia.50mm Clamps', 'unit': 'NOS.', 'qty_per': 4, 'sku': '8010500', 'price': 118},
-    ]
-    
-    rows = []
-    sr = 1
-    
-    for mat in materials:
-        fixture = mat['fixture']
-        row = {
-            'SR. NO.': sr,
-            'DESCRIPTION': mat['desc'],
-            'UNIT': mat['unit'],
-            'SKU': mat['sku'],
-            'Unit Price': mat['price'],
-            'Discount': '35%'
+        profile[stype] = {
+            "fonts": fonts_by_role,
+            "images": extract_image_profile(slide),
         }
-        
-        for sh in sh_data:
-            sh_id = sh['sh']
-            count = sh['fixtures'].get(fixture, 0)
-            qty = round(count * mat['qty_per'], 2) if count > 0 else ''
-            row[sh_id] = qty
-        
-        total_qty = sum(
-            sh['fixtures'].get(fixture, 0) * mat['qty_per']
-            for sh in sh_data
-        )
-        row['Total QTY'] = round(total_qty, 2) if total_qty > 0 else 0
-        row['Amount'] = round(total_qty * mat['price'] * 0.65, 2)
-        
-        rows.append(row)
-        sr += 1
-    
-    df = pd.DataFrame(rows)
-    
-    # Write Excel
-    temp_dir = tempfile.gettempdir()
-    out_path = os.path.join(temp_dir, f"{project_name}_BOQ.xlsx")
-    
-    with pd.ExcelWriter(out_path, engine='openpyxl') as writer:
-        df.to_excel(writer, sheet_name='BOQ', index=False)
-        
-        # Summary
-        total = df['Amount'].sum()
-        summary = pd.DataFrame([
-            {'Description': 'Project Name', 'Value': project_name},
-            {'Description': 'Total Shafts', 'Value': len(sh_data)},
-            {'Description': 'Total Line Items', 'Value': len(df)},
-            {'Description': 'Sub Total (ex-tax)', 'Value': round(total, 2)},
-            {'Description': 'GST 18%', 'Value': round(total * 0.18, 2)},
-            {'Description': 'Grand Total', 'Value': round(total * 1.18, 2)},
-        ])
-        summary.to_excel(writer, sheet_name='Summary', index=False)
-        
-        # Shaft summary
-        shaft_summary = pd.DataFrame([
-            {
-                'SH': sh['sh'],
-                'Type': sh.get('type', 'Standard'),
-                'WC': sh['fixtures'].get('WC', 0),
-                'Wash Basin': sh['fixtures'].get('Wash Basin', 0),
-                'Floor Drain': sh['fixtures'].get('Floor Drain', 0),
-                'Kitchen Sink': sh['fixtures'].get('Kitchen Sink', 0),
-            }
-            for sh in sh_data
-        ])
-        shaft_summary.to_excel(writer, sheet_name='Shaft Summary', index=False)
-    
-    return df, out_path
 
-# ─── HERO HEADER ─────────────────────────────────────────────────
+    # Fallback: if no closing slide, copy content
+    if "closing" not in profile and "content" in profile:
+        profile["closing"] = copy.deepcopy(profile["content"])
+    if "cover" not in profile and "content" in profile:
+        profile["cover"] = copy.deepcopy(profile["content"])
+
+    return profile
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FORMATTING ENGINE
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _apply_run_font(run, font_info: dict, opts: dict):
+    """Apply font_info to a single run."""
+    f = run.font
+    if opts.get("fix_font_name") and font_info.get("name"):
+        f.name = font_info["name"]
+    if opts.get("fix_font_size") and font_info.get("size"):
+        f.size = font_info["size"]
+    if opts.get("fix_bold") and font_info.get("bold") is not None:
+        f.bold = font_info["bold"]
+    if opts.get("fix_color") and font_info.get("color"):
+        try:
+            f.color.rgb = font_info["color"]
+        except Exception:
+            pass
+
+
+def _apply_para_spacing(para, font_info: dict, opts: dict):
+    """Apply paragraph spacing from font_info."""
+    if not opts.get("fix_spacing"):
+        return
+    try:
+        if font_info.get("space_before") is not None:
+            para.space_before = font_info["space_before"]
+        if font_info.get("space_after") is not None:
+            para.space_after = font_info["space_after"]
+        if font_info.get("line_spacing") is not None:
+            para.line_spacing = font_info["line_spacing"]
+    except Exception:
+        pass
+
+
+def format_slide_text(slide, fonts_by_role: dict, opts: dict, changes: list):
+    """Apply template font profile to all text shapes in a slide."""
+    for shape in slide.shapes:
+        if not shape.has_text_frame:
+            continue
+        role = _guess_shape_role(shape, slide)
+        font_info = fonts_by_role.get(role) or fonts_by_role.get("body") or {}
+        if not font_info:
+            continue
+
+        for para in shape.text_frame.paragraphs:
+            _apply_para_spacing(para, font_info, opts)
+            for run in para.runs:
+                old_name = run.font.name
+                old_size = run.font.size
+                _apply_run_font(run, font_info, opts)
+                if run.font.name != old_name or run.font.size != old_size:
+                    changes.append(f"Font fixed in shape '{shape.name}' [{role}]")
+                    break  # one change log per shape is enough
+
+
+def format_slide_images(slide, img_profiles: list, opts: dict, changes: list):
+    """Reposition and resize images to match template positions."""
+    if not opts.get("fix_images") or not img_profiles:
+        return
+
+    pictures = [s for s in slide.shapes if s.shape_type == 13]
+    if not pictures:
+        return
+
+    for idx, pic in enumerate(pictures):
+        # Use the matching template slot; if more images than template has, use last slot
+        slot = img_profiles[min(idx, len(img_profiles) - 1)]
+        old_box = (pic.left, pic.top, pic.width, pic.height)
+        try:
+            pic.left   = slot["left"]
+            pic.top    = slot["top"]
+            pic.width  = slot["width"]
+            pic.height = slot["height"]
+            new_box = (pic.left, pic.top, pic.width, pic.height)
+            if old_box != new_box:
+                changes.append(f"Image {idx+1} repositioned/resized on slide")
+        except Exception as e:
+            changes.append(f"⚠ Image {idx+1} could not be repositioned: {e}")
+
+
+def format_report(template_prs: Presentation, report_prs: Presentation, opts: dict) -> tuple:
+    """
+    Main entry: format report using template profile.
+    Returns (formatted_prs, list_of_changes, stats_dict).
+    """
+    profile = build_template_profile(template_prs)
+    total = len(report_prs.slides)
+    all_changes = []
+    stats = {"slides": total, "font_fixes": 0, "image_fixes": 0, "slides_touched": 0}
+
+    for idx, slide in enumerate(report_prs.slides):
+        stype = classify_slide(idx, total)
+        slide_profile = profile.get(stype, profile.get("content", {}))
+        slide_changes = []
+
+        format_slide_text(slide, slide_profile.get("fonts", {}), opts, slide_changes)
+        format_slide_images(slide, slide_profile.get("images", []), opts, slide_changes)
+
+        if slide_changes:
+            stats["slides_touched"] += 1
+            for c in slide_changes:
+                if "Font" in c:
+                    stats["font_fixes"] += 1
+                if "Image" in c:
+                    stats["image_fixes"] += 1
+                all_changes.append(f"Slide {idx+1} [{stype}] — {c}")
+
+    return report_prs, all_changes, stats
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PPTX I/O HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_prs(uploaded_file) -> Presentation:
+    return Presentation(io.BytesIO(uploaded_file.read()))
+
+
+def save_prs(prs: Presentation) -> bytes:
+    buf = io.BytesIO()
+    prs.save(buf)
+    return buf.getvalue()
+
+
+def describe_template(prs: Presentation) -> dict:
+    """Return quick summary of template for display."""
+    profile = build_template_profile(prs)
+    summary = {}
+    for stype, data in profile.items():
+        fonts = data.get("fonts", {})
+        body = fonts.get("body") or fonts.get("title") or {}
+        summary[stype] = {
+            "font_name": body.get("name", "—"),
+            "font_size_pt": round(body["size"].pt, 1) if body.get("size") else "—",
+            "bold": body.get("bold"),
+            "image_slots": len(data.get("images", [])),
+        }
+    return summary
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SESSION STATE INIT
+# ─────────────────────────────────────────────────────────────────────────────
+
+if "template_bytes" not in st.session_state:
+    st.session_state.template_bytes = None
+if "template_name" not in st.session_state:
+    st.session_state.template_name = None
+if "template_saved" not in st.session_state:
+    st.session_state.template_saved = False
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HEADER
+# ─────────────────────────────────────────────────────────────────────────────
+
 st.markdown("""
-<div class="hero">
-    <h1>HULIOT DIP</h1>
-    <p>DRAWING INTELLIGENCE PLATFORM &nbsp;|&nbsp; DXF VIEWER &nbsp;+&nbsp; AI ANALYSIS &nbsp;+&nbsp; BOQ GENERATOR</p>
+<div class="main-header">
+  <h1>🔧 Huliot PPT Report Formatter</h1>
+  <p>Auto-format team site visit reports to your standard template — Phase 1</p>
 </div>
 """, unsafe_allow_html=True)
 
-# ─── SIDEBAR ─────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# SIDEBAR — TEMPLATE MANAGEMENT & OPTIONS
+# ─────────────────────────────────────────────────────────────────────────────
+
 with st.sidebar:
-    st.markdown('<div class="section-title">PROJECT</div>', unsafe_allow_html=True)
-    
-    project_name = st.text_input("Project Name", "Huliot Project")
-    consultant = st.text_input("Consultant", "")
-    floors = st.number_input("Total Floors", 1, 50, 1)
-    
-    st.markdown("---")
-    st.markdown('<div class="section-title">AI SETTINGS</div>', unsafe_allow_html=True)
-    
-    api_key = st.text_input(
-        "Anthropic API Key",
-        type="password",
-        placeholder="sk-ant-...",
-        help="Get from console.anthropic.com"
-    )
-    if api_key:
-        st.markdown('<span style="color:#00ff88; font-size:0.8rem;">✓ API Key set</span>', unsafe_allow_html=True)
+    st.markdown("### 📁 Master Template")
+
+    if st.session_state.template_saved:
+        st.success(f"✅ Template loaded: **{st.session_state.template_name}**")
+        if st.button("🔄 Replace Template"):
+            st.session_state.template_bytes = None
+            st.session_state.template_saved = False
+            st.rerun()
+
+        # Show template summary
+        try:
+            prs_tmp = Presentation(io.BytesIO(st.session_state.template_bytes))
+            summary = describe_template(prs_tmp)
+            st.markdown("**Template Profile:**")
+            for stype, info in summary.items():
+                st.markdown(f"*{stype.title()}* — `{info['font_name']}` {info['font_size_pt']}pt · {info['image_slots']} img slot(s)")
+        except Exception:
+            pass
     else:
-        st.markdown('<span style="color:#ffaa00; font-size:0.8rem;">⚠ Add key for AI analysis</span>', unsafe_allow_html=True)
-    
+        tpl_file = st.file_uploader(
+            "Upload your standard PPT template",
+            type=["pptx"],
+            key="template_upload",
+            help="Upload once — it stays loaded for all reports this session."
+        )
+        if tpl_file:
+            st.session_state.template_bytes = tpl_file.read()
+            st.session_state.template_name = tpl_file.name
+            st.session_state.template_saved = True
+            st.rerun()
+
     st.markdown("---")
-    st.markdown('<div class="section-title">SETTINGS</div>', unsafe_allow_html=True)
-    
-    detection_radius = st.slider("SH Detection Radius (mm)", 500, 10000, 3000, 500)
-    discount_pct = st.slider("Discount %", 0, 50, 35)
-    include_tax = st.checkbox("Include 18% GST", True)
-    
+    st.markdown("### ⚙️ Formatting Options")
+
+    fix_font_name  = st.checkbox("Font name (e.g. Book Antiqua)", value=True)
+    fix_font_size  = st.checkbox("Font size",                      value=True)
+    fix_bold       = st.checkbox("Bold / normal style",            value=True)
+    fix_color      = st.checkbox("Font color",                     value=True)
+    fix_spacing    = st.checkbox("Line & paragraph spacing",       value=True)
+    fix_images     = st.checkbox("Photo size & position",          value=True)
+
+    opts = {
+        "fix_font_name": fix_font_name,
+        "fix_font_size":  fix_font_size,
+        "fix_bold":       fix_bold,
+        "fix_color":      fix_color,
+        "fix_spacing":    fix_spacing,
+        "fix_images":     fix_images,
+    }
+
     st.markdown("---")
-    st.markdown('<div class="section-title">LEGEND</div>', unsafe_allow_html=True)
+    st.markdown("### ℹ️ How it works")
     st.markdown("""
-    <div style="font-family:'IBM Plex Mono',monospace; font-size:0.72rem; color:#8a8a7a; line-height:2;">
-    🔴 WC &nbsp;|&nbsp; 110mm<br>
-    🟡 Basin &nbsp;|&nbsp; 50mm<br>
-    🟢 Floor Drain &nbsp;|&nbsp; 75mm<br>
-    🔵 Kitchen &nbsp;|&nbsp; 50mm
-    </div>
-    """, unsafe_allow_html=True)
+1. Upload template once (saved this session)
+2. Upload team's raw report
+3. Click **Format Report**
+4. Download clean PPT
+    """)
+    st.caption("Phase 1 — Formatting only. Content is preserved.")
 
-# ─── MAIN TABS ───────────────────────────────────────────────────
-tab1, tab2, tab3, tab4 = st.tabs(["📐 VIEWER", "🤖 AI ANALYSIS", "📊 BOQ", "📥 EXPORT"])
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN CONTENT — UPLOAD + FORMAT
+# ─────────────────────────────────────────────────────────────────────────────
 
-# ─── TAB 1: VIEWER ───────────────────────────────────────────────
-with tab1:
-    col_upload, col_info = st.columns([3, 1])
-    
-    with col_upload:
-        st.markdown('<div class="section-title">UPLOAD DRAWING</div>', unsafe_allow_html=True)
-        uploaded = st.file_uploader(
-            "Upload DXF File",
-            type=['dxf'],
-            help="Upload DXF file. Export from AutoCAD: File > Save As > AutoCAD 2018 DXF"
-        )
-    
-    if uploaded:
-        # Save file
-        temp_dir = tempfile.gettempdir()
-        dxf_path = os.path.join(temp_dir, uploaded.name)
-        with open(dxf_path, 'wb') as f:
-            f.write(uploaded.getvalue())
-        st.session_state.dxf_path = dxf_path
-        
-        # Get stats
-        with st.spinner("Reading DXF..."):
-            stats, doc = get_dxf_stats(dxf_path)
-        
-        if stats:
-            st.session_state.dxf_doc = doc
-            
-            # Stats row
-            cols = st.columns(5)
-            stat_items = [
-                ("ENTITIES", sum(stats['entities'].values())),
-                ("LAYERS", len(stats['layers'])),
-                ("BLOCKS", len(stats['blocks'])),
-                ("TEXT ITEMS", len(stats['texts'])),
-                ("SH MARKS", len(stats['sh_marks'])),
-            ]
-            for i, (lbl, val) in enumerate(stat_items):
-                with cols[i]:
-                    st.markdown(f"""
-                    <div class="stat-card">
-                        <div class="val">{val}</div>
-                        <div class="lbl">{lbl}</div>
-                    </div>
-                    """, unsafe_allow_html=True)
-            
-            st.markdown("---")
-            
-            # SH marks found
-            if stats['sh_marks']:
-                st.markdown(f'<span class="status-ok">✓ SH MARKS DETECTED: {" | ".join(stats["sh_marks"])}</span>', unsafe_allow_html=True)
-                
-                # Auto-populate sh_data for BOQ
-                if not st.session_state.sh_data:
-                    auto_sh = []
-                    for sh_id in stats['sh_marks']:
-                        auto_sh.append({
-                            'sh': sh_id,
-                            'type': 'Standard Toilet',
-                            'fixtures': {'WC': 1, 'Wash Basin': 1, 'Floor Drain': 1, 'Kitchen Sink': 0}
-                        })
-                    st.session_state.sh_data = auto_sh
-                    st.info(f"✅ {len(auto_sh)} shafts auto-loaded. Go to BOQ tab → adjust fixtures → generate BOQ.")
-            else:
-                st.markdown('<span class="status-warn">⚠ SH blocks found (red circles) but text inside not readable as plain text. Use AI Analysis tab to detect shafts from drawing image.</span>', unsafe_allow_html=True)
-            
-            st.markdown("---")
-            
-            # Render drawing
-            st.markdown('<div class="section-title">DRAWING VIEW</div>', unsafe_allow_html=True)
-            
-            with st.spinner("Rendering drawing..."):
-                img_bytes = render_dxf_to_image(dxf_path)
-            
-            if img_bytes:
-                st.session_state.drawing_image = img_bytes
-                st.image(img_bytes, use_container_width=True, caption=f"{uploaded.name}")
-            else:
-                st.warning("⚠️ Drawing too large/complex to auto-render.")
-                st.markdown("""
-                <div style="background:#1a1200; border:1px solid #ffaa00; border-radius:8px; padding:1rem; margin:1rem 0;">
-                    <b style="color:#ffaa00;">📸 Upload a Screenshot Instead</b><br>
-                    <span style="color:#b0a070; font-size:0.85rem; font-family:'IBM Plex Mono',monospace;">
-                    1. Open DXF in AutoCAD / DWG TrueView<br>
-                    2. Press Print Screen or Snipping Tool<br>
-                    3. Upload screenshot below<br>
-                    4. AI will read SH marks from image
-                    </span>
-                </div>
-                """, unsafe_allow_html=True)
-                
-                screenshot = st.file_uploader(
-                    "Upload Drawing Screenshot",
-                    type=['png', 'jpg', 'jpeg'],
-                    key="screenshot_upload"
-                )
-                if screenshot:
-                    img_bytes = screenshot.getvalue()
-                    st.session_state.drawing_image = img_bytes
-                    st.image(img_bytes, use_container_width=True, caption="Screenshot uploaded")
-                    st.success("✅ Screenshot ready. Go to 🤖 AI ANALYSIS tab.")
-            
-            # Layer info
-            with st.expander("📋 Layers & Blocks"):
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.markdown("**Layers:**")
-                    for layer in stats['layers'][:20]:
-                        st.code(layer, language='')
-                with col2:
-                    st.markdown("**Blocks:**")
-                    for block in stats['blocks'][:20]:
-                        st.code(block, language='')
-        else:
-            st.error("❌ Could not read DXF file. Ensure it's a valid DXF (not DWG).")
-    else:
-        st.markdown("""
-        <div class="upload-zone">
-            <h3 style="color:#1a5f3c; font-family:'Bebas Neue',sans-serif;">UPLOAD DXF TO BEGIN</h3>
-            <p style="color:#8a8a7a; font-family:'IBM Plex Mono',monospace; font-size:0.8rem;">
-            Export from AutoCAD: FILE → SAVE AS → AUTOCAD 2018 DXF
-            </p>
+if not st.session_state.template_saved:
+    st.info("👈 Start by uploading your **master template** in the sidebar.")
+    st.stop()
+
+col1, col2 = st.columns([1.1, 0.9])
+
+with col1:
+    st.markdown("### 📤 Upload Team Report")
+    report_file = st.file_uploader(
+        "Drop the raw team PPT report here",
+        type=["pptx"],
+        key="report_upload",
+        label_visibility="collapsed"
+    )
+
+    if report_file:
+        st.markdown(f"""
+        <div class="status-box">
+        📄 <b>{report_file.name}</b><br>
+        Size: {report_file.size / 1024:.0f} KB
         </div>
         """, unsafe_allow_html=True)
 
-# ─── TAB 2: AI ANALYSIS ──────────────────────────────────────────
-with tab2:
-    st.markdown('<div class="section-title">AI DRAWING ANALYSIS</div>', unsafe_allow_html=True)
-    
-    # Allow direct image upload here too
-    ai_image = None
-    
-    if st.session_state.drawing_image:
-        ai_image = st.session_state.drawing_image
-        st.image(ai_image, use_container_width=True, caption="Drawing for AI analysis")
-    else:
-        st.markdown("""
-        <div style="background:#0d1a12; border:1px solid #1a5f3c; border-radius:8px; padding:1.5rem; margin-bottom:1rem;">
-            <b style="color:#00ff88; font-family:'Bebas Neue',sans-serif; font-size:1.3rem;">UPLOAD DRAWING IMAGE DIRECTLY</b><br>
-            <span style="color:#8a8a7a; font-size:0.82rem; font-family:'IBM Plex Mono',monospace;">
-            No DXF needed. Take a screenshot of your drawing and upload here.<br>
-            AI will read SH marks visually from the image.
-            </span>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        direct_img = st.file_uploader(
-            "Upload Drawing Screenshot / Image",
-            type=['png', 'jpg', 'jpeg'],
-            key="ai_direct_image"
-        )
-        if direct_img:
-            ai_image = direct_img.getvalue()
-            st.session_state.drawing_image = ai_image
-            st.image(ai_image, use_container_width=True, caption="Uploaded for AI analysis")
-    
-    if ai_image:
-        context = st.text_input(
-            "Project context (optional)",
-            placeholder="e.g. Residential tower, typical floor, 4 bathrooms per floor"
-        )
-        
-        col1, col2 = st.columns([2, 1])
-        with col1:
-            analyze_btn = st.button("🤖 Analyze Drawing with AI", type="primary", use_container_width=True)
-        with col2:
-            manual_btn = st.button("✏️ Enter Shafts Manually", use_container_width=True)
-        
-        if analyze_btn:
-            if not api_key:
-                st.error("❌ Add your Anthropic API key in the sidebar first.")
-                st.info("Get free API key at: https://console.anthropic.com")
-            else:
-                with st.spinner("AI reading SH marks from drawing image... (30-60 sec)"):
-                    result = analyze_drawing_with_ai(ai_image, api_key, context)
-            
-            if result:
-                st.session_state.analysis_done = True
-                
-                st.markdown(f"""
-                <div style="background:#0d1a12; border:1px solid #1a5f3c; border-radius:8px; padding:1rem; margin:1rem 0;">
-                    <span style="color:#8a8a7a; font-family:'IBM Plex Mono',monospace; font-size:0.8rem;">
-                    DRAWING TYPE: <b style="color:#00ff88">{result.get('drawing_type','Unknown')}</b> &nbsp;|&nbsp;
-                    CONFIDENCE: <b style="color:#00ff88">{result.get('confidence','Medium')}</b> &nbsp;|&nbsp;
-                    SHAFTS: <b style="color:#00ff88">{result.get('total_shafts', len(result.get('shafts',[])))}</b>
-                    </span>
-                </div>
-                """, unsafe_allow_html=True)
-                
-                if result.get('observations'):
-                    st.markdown(f"**Observations:** {result['observations']}")
-                
-                # Build SH data for BOQ
-                sh_data = []
-                for shaft in result.get('shafts', []):
-                    sh_data.append({
-                        'sh': shaft['id'],
-                        'type': shaft.get('bathroom_type', 'Standard'),
-                        'fixtures': shaft.get('fixtures', {'WC': 1, 'Wash Basin': 1, 'Floor Drain': 1}),
-                        'notes': shaft.get('notes', '')
-                    })
-                
-                st.session_state.sh_data = sh_data
-                
-                # Show shaft cards
-                st.markdown('<div class="section-title">DETECTED SHAFTS</div>', unsafe_allow_html=True)
-                
-                for sh in sh_data:
-                    fix = sh['fixtures']
-                    st.markdown(f"""
-                    <div class="sh-card">
-                        <div class="sh-label">{sh['sh']}</div>
-                        <div class="sh-type">{sh['type']}</div>
-                        <div class="fixture-row">
-                            <span class="fix-item">🔴 WC: {fix.get('WC',0)}</span>
-                            <span class="fix-item">🟡 BASIN: {fix.get('Wash Basin',0)}</span>
-                            <span class="fix-item">🟢 DRAIN: {fix.get('Floor Drain',0)}</span>
-                            <span class="fix-item">🔵 KIT: {fix.get('Kitchen Sink',0)}</span>
-                        </div>
-                        {f'<div style="font-size:0.72rem; color:#8a8a7a; margin-top:0.5rem;">{sh["notes"]}</div>' if sh.get('notes') else ''}
-                    </div>
-                    """, unsafe_allow_html=True)
-            else:
-                st.error("AI analysis failed. Use manual entry.")
-        
-        if manual_btn or (not st.session_state.analysis_done and not analyze_btn):
-            st.markdown('<div class="section-title">MANUAL SHAFT ENTRY</div>', unsafe_allow_html=True)
-            
-            num_shafts = st.number_input("Number of Shafts (Bathrooms)", 1, 50, 4)
-            
-            sh_data_manual = []
-            
-            for i in range(int(num_shafts)):
-                with st.expander(f"SH-{str(i+1).zfill(2)}", expanded=i < 3):
-                    col1, col2, col3, col4, col5 = st.columns(5)
-                    
-                    sh_id = col1.text_input("SH ID", f"SH-{str(i+1).zfill(2)}", key=f"sh_id_{i}")
-                    wc = col2.number_input("WC", 0, 10, 1, key=f"wc_{i}")
-                    basin = col3.number_input("Basin", 0, 10, 1, key=f"basin_{i}")
-                    drain = col4.number_input("FD", 0, 10, 1, key=f"drain_{i}")
-                    kitchen = col5.number_input("KIT", 0, 10, 0, key=f"kit_{i}")
-                    
-                    sh_data_manual.append({
-                        'sh': sh_id,
-                        'type': 'Standard',
-                        'fixtures': {
-                            'WC': wc,
-                            'Wash Basin': basin,
-                            'Floor Drain': drain,
-                            'Kitchen Sink': kitchen
-                        }
-                    })
-            
-            if st.button("✅ Confirm Shafts", type="primary", use_container_width=True):
-                st.session_state.sh_data = sh_data_manual
-                st.success(f"✅ {num_shafts} shafts configured")
-
-# ─── TAB 3: BOQ ──────────────────────────────────────────────────
-with tab3:
-    st.markdown('<div class="section-title">BILL OF QUANTITIES</div>', unsafe_allow_html=True)
-    
-    if not st.session_state.sh_data:
-        st.info("Complete AI Analysis or enter shafts manually first.")
-    else:
-        # Summary cards
-        sh_data = st.session_state.sh_data
-        
-        col1, col2, col3, col4 = st.columns(4)
-        
-        total_wc = sum(s['fixtures'].get('WC', 0) for s in sh_data)
-        total_basin = sum(s['fixtures'].get('Wash Basin', 0) for s in sh_data)
-        total_drain = sum(s['fixtures'].get('Floor Drain', 0) for s in sh_data)
-        
-        metrics = [
-            ("SHAFTS", len(sh_data)),
-            ("TOTAL WC", total_wc),
-            ("TOTAL BASINS", total_basin),
-            ("TOTAL DRAINS", total_drain)
-        ]
-        
-        for col, (lbl, val) in zip([col1, col2, col3, col4], metrics):
-            with col:
-                st.markdown(f"""
-                <div class="stat-card">
-                    <div class="val">{val}</div>
-                    <div class="lbl">{lbl}</div>
-                </div>
-                """, unsafe_allow_html=True)
-        
-        st.markdown("---")
-        
-        # Generate BOQ
-        if st.button("📊 Generate BOQ", type="primary", use_container_width=True):
-            with st.spinner("Generating BOQ..."):
-                df, boq_path = generate_boq_excel(sh_data, project_name)
-            
-            st.session_state.boq_df = df
-            st.session_state.boq_path = boq_path
-            
-            total_amount = df['Amount'].sum()
-            
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.markdown(f"""<div class="stat-card">
-                    <div class="val">{len(df)}</div>
-                    <div class="lbl">LINE ITEMS</div>
-                </div>""", unsafe_allow_html=True)
-            with col2:
-                st.markdown(f"""<div class="stat-card">
-                    <div class="val">₹{total_amount/100000:.1f}L</div>
-                    <div class="lbl">SUB TOTAL</div>
-                </div>""", unsafe_allow_html=True)
-            with col3:
-                st.markdown(f"""<div class="stat-card">
-                    <div class="val">₹{total_amount*1.18/100000:.1f}L</div>
-                    <div class="lbl">GRAND TOTAL</div>
-                </div>""", unsafe_allow_html=True)
-            
-            st.markdown("---")
-            st.markdown('<div class="section-title">BOQ PREVIEW</div>', unsafe_allow_html=True)
-            st.dataframe(df, use_container_width=True, height=400)
-
-# ─── TAB 4: EXPORT ───────────────────────────────────────────────
-with tab4:
-    st.markdown('<div class="section-title">EXPORT FILES</div>', unsafe_allow_html=True)
-    
-    if st.session_state.boq_df is None:
-        st.info("Generate BOQ in the BOQ tab first.")
-    else:
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.markdown("### 📊 BOQ Excel")
+        try:
+            report_bytes_raw = report_file.read()
+            prs_check = Presentation(io.BytesIO(report_bytes_raw))
+            n_slides = len(prs_check.slides)
+            n_imgs = sum(
+                1 for slide in prs_check.slides
+                for shape in slide.shapes if shape.shape_type == 13
+            )
             st.markdown(f"""
-            <div class="sh-card">
-                <div style="font-family:'IBM Plex Mono',monospace; font-size:0.8rem; color:#b0c0b0;">
-                    <b>Project:</b> {project_name}<br>
-                    <b>Shafts:</b> {len(st.session_state.sh_data)}<br>
-                    <b>Items:</b> {len(st.session_state.boq_df)}<br>
-                    <b>Sheets:</b> BOQ / Summary / Shaft Summary
-                </div>
+            <div class="metric-row">
+              <div class="metric-box"><div class="val">{n_slides}</div><div class="lbl">Slides</div></div>
+              <div class="metric-box"><div class="val">{n_imgs}</div><div class="lbl">Photos</div></div>
             </div>
             """, unsafe_allow_html=True)
-            
-            with open(st.session_state.boq_path, 'rb') as f:
-                st.download_button(
-                    "⬇️ Download BOQ Excel",
-                    f.read(),
-                    file_name=f"{project_name}_BOQ.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True
-                )
-        
-        with col2:
-            st.markdown("### 📐 Marked DXF")
-            st.markdown(f"""
-            <div class="sh-card">
-                <div style="font-family:'IBM Plex Mono',monospace; font-size:0.8rem; color:#b0c0b0;">
-                    Original DXF with SH labels added<br>
-                    (if DXF was uploaded)
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
-            
-            if st.session_state.dxf_path:
-                with open(st.session_state.dxf_path, 'rb') as f:
-                    st.download_button(
-                        "⬇️ Download DXF",
-                        f.read(),
-                        file_name=f"{project_name}_marked.dxf",
-                        mime="application/dxf",
-                        use_container_width=True
+        except Exception as e:
+            st.error(f"Could not read report: {e}")
+            st.stop()
+
+        if st.button("🚀 Format Report Now"):
+            with st.spinner("Applying template formatting…"):
+                try:
+                    # Fresh load of both files
+                    prs_template = Presentation(io.BytesIO(st.session_state.template_bytes))
+                    prs_report   = Presentation(io.BytesIO(report_bytes_raw))
+
+                    formatted_prs, changes, stats = format_report(prs_template, prs_report, opts)
+                    formatted_bytes = save_prs(formatted_prs)
+
+                    # Store results in session state
+                    st.session_state["formatted_bytes"]  = formatted_bytes
+                    st.session_state["formatted_changes"] = changes
+                    st.session_state["formatted_stats"]   = stats
+                    st.session_state["formatted_name"]    = (
+                        report_file.name.replace(".pptx", "") +
+                        "_formatted_" + datetime.now().strftime("%d%b%Y") + ".pptx"
                     )
+                except Exception as e:
+                    st.error(f"Formatting failed: {e}")
+                    import traceback
+                    st.code(traceback.format_exc())
 
-# ─── FOOTER ──────────────────────────────────────────────────────
+with col2:
+    st.markdown("### 📥 Download Result")
+
+    if "formatted_bytes" in st.session_state and st.session_state["formatted_bytes"]:
+        stats   = st.session_state["formatted_stats"]
+        changes = st.session_state["formatted_changes"]
+        fname   = st.session_state["formatted_name"]
+
+        st.success("✅ Formatting complete!")
+
+        st.markdown(f"""
+        <div class="metric-row">
+          <div class="metric-box"><div class="val">{stats['slides_touched']}</div><div class="lbl">Slides Fixed</div></div>
+          <div class="metric-box"><div class="val">{stats['font_fixes']}</div><div class="lbl">Font Fixes</div></div>
+          <div class="metric-box"><div class="val">{stats['image_fixes']}</div><div class="lbl">Image Fixes</div></div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        st.download_button(
+            label="⬇️ Download Formatted PPT",
+            data=st.session_state["formatted_bytes"],
+            file_name=fname,
+            mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            use_container_width=True,
+        )
+
+        if changes:
+            with st.expander(f"📋 Change log ({len(changes)} changes)", expanded=False):
+                for c in changes:
+                    st.markdown(f"- {c}")
+        else:
+            st.markdown("""
+            <div class="warn-box">
+            ℹ No formatting differences detected. The report may already match the template,
+            or the template has no explicit font/size values set on runs.
+            </div>
+            """, unsafe_allow_html=True)
+    else:
+        st.markdown("""
+        <div style="text-align:center; color:#aaa; padding: 3rem 1rem;">
+        <div style="font-size:3rem">📋</div>
+        <div>Upload a report and click<br><b>Format Report Now</b></div>
+        </div>
+        """, unsafe_allow_html=True)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FOOTER
+# ─────────────────────────────────────────────────────────────────────────────
+
 st.markdown("---")
-st.markdown("""
-<div style="text-align:center; padding:1rem 0; font-family:'IBM Plex Mono',monospace; font-size:0.72rem; color:#8a8a7a;">
-    HULIOT DRAWING INTELLIGENCE PLATFORM v3.0 &nbsp;|&nbsp; 
-    AI-POWERED PLUMBING BOQ &nbsp;|&nbsp; 
-    HULIOT PIPES & FITTINGS PVT. LTD.
-</div>
-""", unsafe_allow_html=True)
+st.caption("Huliot Pipes & Fittings Pvt Ltd · PPT Formatter v1.0 · Phase 1 · Built with python-pptx + Streamlit")
