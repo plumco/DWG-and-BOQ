@@ -1,897 +1,404 @@
 """
-Huliot Drawing Intelligence Platform
-DXF Viewer + AI Analysis + BOQ Generator
+Huliot CAD Quantity Extractor
+Usage: python3 extract_qty.py <path_to_dxf_file> [--scale 1:100]
+
+Extracts block INSERT quantities + pipe line counts from a DXF file.
+Outputs:
+  - Console summary
+  - quantity_takeoff_<name>.xlsx
+  - blocks_raw.csv
 """
 
-import streamlit as st
-import pandas as pd
-import ezdxf
-from ezdxf.addons.drawing import RenderContext, Frontend
-from ezdxf.addons.drawing.matplotlib import MatplotlibBackend
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-import io, os, re, math, base64, json, tempfile
-import requests
-from io import BytesIO
+import sys
+import os
+import re
+import math
+from collections import Counter, defaultdict
+from pathlib import Path
 
-# ─── PAGE CONFIG ────────────────────────────────────────────────
-st.set_page_config(
-    page_title="Huliot DIP",
-    page_icon="🏗️",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+try:
+    import ezdxf
+except ImportError:
+    print("Installing ezdxf...")
+    import subprocess
+    subprocess.run([sys.executable, "-m", "pip", "install", "ezdxf", "openpyxl",
+                    "--break-system-packages", "-q"])
+    import ezdxf
 
-# ─── STYLES ─────────────────────────────────────────────────────
-st.markdown("""
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Bebas+Neue&family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@300;400;600;700&display=swap');
+try:
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+    HAS_EXCEL = True
+except ImportError:
+    HAS_EXCEL = False
 
-html, body, .stApp { background:#0a0d13; color:#e8e8e0; font-family:'IBM Plex Sans', sans-serif; }
 
-h1,h2,h3 { font-family:'Bebas Neue', sans-serif; letter-spacing:0.05em; }
+# ─────────────────────────────────────────────────────────────────────────────
+# BLOCK NAME PARSER
+# ─────────────────────────────────────────────────────────────────────────────
 
-.hero {
-    background: linear-gradient(135deg, #0d2818 0%, #0a1a0a 50%, #0d1a2a 100%);
-    border: 1px solid #1a5f3c;
-    border-radius: 12px;
-    padding: 2.5rem;
-    margin-bottom: 2rem;
-    position: relative;
-    overflow: hidden;
-}
-.hero::before {
-    content: '';
-    position: absolute;
-    top: -50%;
-    left: -50%;
-    width: 200%;
-    height: 200%;
-    background: radial-gradient(ellipse at center, rgba(26,95,60,0.15) 0%, transparent 60%);
-    pointer-events: none;
-}
-.hero h1 { font-size:3.5rem; color:#00ff88; margin:0; line-height:1; }
-.hero p { color:#8a8a7a; font-family:'IBM Plex Mono', monospace; font-size:0.85rem; margin-top:0.5rem; }
+PRODUCT_PATTERNS = [
+    (r"US_|ULTRA.?SILENT",       "Ultra Silent"),
+    (r"PAP_|HELIROMA|PERT.AL",   "PERT-AL-PERT / Heliroma"),
+    (r"HULIOT_|HTP_|HT.?PRO",    "HT Pro"),
+]
 
-.stat-card {
-    background: #0d1a12;
-    border: 1px solid #1a5f3c;
-    border-radius: 8px;
-    padding: 1.2rem;
-    text-align: center;
-    transition: border-color 0.2s;
-}
-.stat-card:hover { border-color: #00ff88; }
-.stat-card .val { font-size:2rem; font-weight:700; color:#00ff88; font-family:'Bebas Neue', sans-serif; }
-.stat-card .lbl { font-size:0.7rem; color:#8a8a7a; text-transform:uppercase; letter-spacing:0.1em; margin-top:0.2rem; font-family:'IBM Plex Mono', monospace; }
+TYPE_PATTERNS = [
+    (r"ELBOW|ELB",               "Elbow"),
+    (r"TEE|WYE|Y.BRANCH",        "Tee / Wye"),
+    (r"REDUCER|REDUC|REDUCTI",   "Reducer"),
+    (r"TRAP",                     "Trap"),
+    (r"WC.?CON|WC|P.TRAP",       "WC Connector"),
+    (r"ACCESS|CLEAN.?OUT|INSPEC", "Access Door"),
+    (r"CAP|PLUG|END",             "End Cap"),
+    (r"CLAMP|BRACKET|CLIP",       "Clamp"),
+    (r"PIPE|SLEEVE",              "Pipe"),
+    (r"COUPLING|JOINT|SOCKET",    "Coupling"),
+    (r"MANIFOLD|HEADER",          "Manifold"),
+    (r"FLOOR.?DRAIN|FD",          "Floor Drain"),
+]
 
-.sh-card {
-    background: #0d1a12;
-    border: 1px solid #1a4a2a;
-    border-left: 4px solid #00ff88;
-    border-radius: 6px;
-    padding: 1rem;
-    margin-bottom: 0.8rem;
-}
-.sh-card .sh-label { font-family:'Bebas Neue', sans-serif; font-size:1.8rem; color:#00ff88; line-height:1; }
-.sh-card .sh-type { font-family:'IBM Plex Mono', monospace; font-size:0.72rem; color:#8a8a7a; text-transform:uppercase; margin-bottom:0.5rem; }
-.sh-card .fixture-row { display:flex; gap:1rem; margin-top:0.5rem; }
-.sh-card .fix-item { background:#0a1409; border:1px solid #1a3a1a; border-radius:4px; padding:0.3rem 0.6rem; font-size:0.75rem; color:#b0c0b0; font-family:'IBM Plex Mono', monospace; }
+DN_SIZES = {"50", "56", "63", "75", "90", "110", "125", "160", "200", "250", "315"}
 
-.boq-header { background:#1a5f3c; color:white; padding:0.8rem 1rem; border-radius:6px 6px 0 0; font-family:'Bebas Neue', sans-serif; font-size:1.4rem; letter-spacing:0.1em; }
 
-.status-ok { color:#00ff88; font-weight:600; }
-.status-err { color:#ff4444; }
-.status-warn { color:#ffaa00; }
+def _parse_sizes(name_up: str) -> list:
+    """Extract DN sizes from block name, ignoring angle values (45°, 87°, 135°)."""
+    nums = re.findall(r"\d+", name_up)
+    dns  = [n for n in nums if n in DN_SIZES]
+    # If 90 appears alongside other DN sizes, it is likely an angle (90°), not DN90
+    if "90" in dns and len(dns) > 1:
+        dns = [n for n in dns if n != "90"]
+    return list(dict.fromkeys(dns))  # deduplicate, preserve order
 
-.upload-zone {
-    border: 2px dashed #1a5f3c;
-    border-radius: 10px;
-    padding: 3rem;
-    text-align: center;
-    background: #0d1a12;
-    transition: all 0.2s;
-}
 
-.section-title {
-    font-family: 'Bebas Neue', sans-serif;
-    font-size: 1.6rem;
-    color: #00ff88;
-    letter-spacing: 0.08em;
-    border-bottom: 1px solid #1a5f3c;
-    padding-bottom: 0.5rem;
-    margin-bottom: 1rem;
-}
+def parse_block_name(name: str) -> dict:
+    name_up = name.upper()
 
-/* Streamlit overrides */
-.stButton > button {
-    background: #1a5f3c !important;
-    color: white !important;
-    border: none !important;
-    border-radius: 6px !important;
-    font-family: 'IBM Plex Mono', monospace !important;
-    font-weight: 600 !important;
-    letter-spacing: 0.05em !important;
-    transition: all 0.2s !important;
-}
-.stButton > button:hover {
-    background: #00ff88 !important;
-    color: #0a0d13 !important;
-}
-.stTabs [data-baseweb="tab"] {
-    font-family: 'IBM Plex Mono', monospace !important;
-    font-size: 0.82rem !important;
-    color: #8a8a7a !important;
-}
-.stTabs [aria-selected="true"] {
-    color: #00ff88 !important;
-    border-bottom-color: #00ff88 !important;
-}
-.stNumberInput > div > div > input,
-.stTextInput > div > div > input {
-    background: #0d1a12 !important;
-    border: 1px solid #1a5f3c !important;
-    color: #e8e8e0 !important;
-    border-radius: 4px !important;
-}
-div[data-testid="stDataFrame"] { border: 1px solid #1a5f3c; border-radius: 6px; overflow: hidden; }
-</style>
-""", unsafe_allow_html=True)
+    # Product line
+    product = "Unknown"
+    for pattern, label in PRODUCT_PATTERNS:
+        if re.search(pattern, name_up):
+            product = label
+            break
 
-# ─── SESSION STATE ───────────────────────────────────────────────
-for k, v in {
-    'dxf_doc': None,
-    'dxf_path': None,
-    'drawing_image': None,
-    'sh_data': [],
-    'boq_df': None,
-    'analysis_done': False
-}.items():
-    if k not in st.session_state:
-        st.session_state[k] = v
+    # Type
+    fitting_type = "Other"
+    for pattern, label in TYPE_PATTERNS:
+        if re.search(pattern, name_up):
+            fitting_type = label
+            break
 
-# ─── FUNCTIONS ───────────────────────────────────────────────────
+    # Sizes
+    sizes = _parse_sizes(name_up)
+    size_str = "×".join(sizes) + " mm" if sizes else "—"
 
-def render_dxf_to_image(dxf_path, dpi=72):
-    """Render DXF to PNG - with fallbacks for large files"""
+    return {
+        "product":  product,
+        "type":     fitting_type,
+        "size":     size_str,
+        "raw_name": name,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LINE LENGTH
+# ─────────────────────────────────────────────────────────────────────────────
+
+def line_length(entity) -> float:
+    """Return length of LINE or LWPOLYLINE entity."""
     try:
-        doc = ezdxf.readfile(dxf_path)
-        msp = doc.modelspace()
-        
-        # Try low-res first for large files
-        fig = plt.figure(figsize=(14, 9), facecolor='#0a0d13')
-        ax = fig.add_axes([0, 0, 1, 1], facecolor='#0a0d13')
-        
-        ctx = RenderContext(doc)
-        backend = MatplotlibBackend(ax)
-        frontend = Frontend(ctx, backend)
-        
-        # Limit rendering for large files
-        frontend.draw_layout(msp, finalize=True)
-        
-        ax.set_facecolor('#0a0d13')
-        for spine in ax.spines.values():
-            spine.set_edgecolor('#1a5f3c')
-        
-        buf = io.BytesIO()
-        fig.savefig(buf, format='png', dpi=dpi, bbox_inches='tight',
-                   facecolor='#0a0d13', edgecolor='none')
-        plt.close(fig)
-        buf.seek(0)
-        return buf.getvalue()
-    except MemoryError:
-        plt.close('all')
-        return None
-    except Exception as e:
-        plt.close('all')
-        return None
+        if entity.dxftype() == "LINE":
+            s = entity.dxf.start
+            e = entity.dxf.end
+            return math.sqrt((e[0]-s[0])**2 + (e[1]-s[1])**2)
+        elif entity.dxftype() == "LWPOLYLINE":
+            pts = list(entity.get_points())
+            total = 0.0
+            for i in range(len(pts) - 1):
+                total += math.sqrt((pts[i+1][0]-pts[i][0])**2 + (pts[i+1][1]-pts[i][1])**2)
+            return total
+    except Exception:
+        return 0.0
+    return 0.0
 
-def get_dxf_stats(dxf_path):
-    """Get basic stats from DXF file - searches TEXT, MTEXT, INSERT, ATTRIB"""
-    try:
-        doc = ezdxf.readfile(dxf_path)
-        msp = doc.modelspace()
-        
-        stats = {'entities': {}, 'layers': set(), 'blocks': set(), 'texts': []}
-        sh_candidates = []
-        
-        for entity in msp:
-            etype = entity.dxftype()
-            stats['entities'][etype] = stats['entities'].get(etype, 0) + 1
-            
-            if hasattr(entity.dxf, 'layer'):
-                stats['layers'].add(entity.dxf.layer)
-            
-            # TEXT and MTEXT
-            if etype in ('TEXT', 'MTEXT'):
-                try:
-                    t = entity.dxf.text if hasattr(entity.dxf, 'text') else ''
-                    if t.strip():
-                        stats['texts'].append(t.strip())
-                        m = re.search(r'SH\s*-?\s*(\d+)', t, re.IGNORECASE)
-                        if m:
-                            pos = (entity.dxf.insert.x, entity.dxf.insert.y) if hasattr(entity.dxf, 'insert') else (0,0)
-                            sh_candidates.append({'sh': f"SH-{m.group(1)}", 'pos': pos, 'source': 'TEXT'})
-                except: pass
-            
-            # INSERT blocks - check block name AND attributes
-            if etype == 'INSERT':
-                try:
-                    bname = entity.dxf.name
-                    stats['blocks'].add(bname)
-                    pos = (entity.dxf.insert.x, entity.dxf.insert.y)
-                    
-                    # Check block name itself for SH pattern
-                    m = re.search(r'SH\s*-?\s*(\d+)', bname, re.IGNORECASE)
-                    if m:
-                        sh_candidates.append({'sh': f"SH-{m.group(1)}", 'pos': pos, 'source': 'BLOCK_NAME'})
-                    
-                    # Check ATTRIB entities inside block
-                    if entity.has_attribs:
-                        for attrib in entity.attribs:
-                            try:
-                                aval = attrib.dxf.text if hasattr(attrib.dxf, 'text') else ''
-                                atag = attrib.dxf.tag if hasattr(attrib.dxf, 'tag') else ''
-                                
-                                # Search value
-                                m = re.search(r'SH\s*-?\s*(\d+)', aval, re.IGNORECASE)
-                                if m:
-                                    sh_candidates.append({'sh': f"SH-{m.group(1)}", 'pos': pos, 'source': 'ATTRIB_VAL'})
-                                
-                                # Search tag
-                                m = re.search(r'SH\s*-?\s*(\d+)', atag, re.IGNORECASE)
-                                if m:
-                                    sh_candidates.append({'sh': f"SH-{m.group(1)}", 'pos': pos, 'source': 'ATTRIB_TAG'})
-                            except: pass
-                    
-                    # Check block definition content
-                    try:
-                        blk = doc.blocks.get(bname)
-                        if blk:
-                            for blk_entity in blk:
-                                if blk_entity.dxftype() in ('TEXT', 'MTEXT', 'ATTDEF'):
-                                    try:
-                                        bt = blk_entity.dxf.text if hasattr(blk_entity.dxf, 'text') else ''
-                                        m = re.search(r'SH\s*-?\s*(\d+)', bt, re.IGNORECASE)
-                                        if m:
-                                            sh_candidates.append({'sh': f"SH-{m.group(1)}", 'pos': pos, 'source': 'BLOCK_DEF'})
-                                    except: pass
-                    except: pass
-                    
-                except: pass
-        
-        stats['layers'] = sorted(list(stats['layers']))
-        stats['blocks'] = sorted(list(stats['blocks']))
-        
-        # Deduplicate SH marks
-        seen = set()
-        sh_marks = []
-        for c in sh_candidates:
-            if c['sh'] not in seen:
-                seen.add(c['sh'])
-                sh_marks.append(c)
-        
-        stats['sh_marks'] = sorted([s['sh'] for s in sh_marks], 
-                                    key=lambda x: int(re.search(r'\d+', x).group()))
-        stats['sh_positions'] = sh_marks
-        
-        return stats, doc
-    except Exception as e:
-        return None, None
 
-def analyze_drawing_with_ai(image_bytes, api_key, project_context=""):
-    """Use Claude Vision API to analyze the drawing"""
-    try:
-        image_b64 = base64.b64encode(image_bytes).decode('utf-8')
-        
-        prompt = f"""You are an expert plumbing engineer analyzing a plumbing drainage floor plan.
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN EXTRACTION
+# ─────────────────────────────────────────────────────────────────────────────
 
-Look carefully at this drawing and find ALL shaft/bathroom labels. These are typically:
-- Red circles with text like "SH12", "SH13", "SH-01" inside
-- Shaft numbers next to toilet/bathroom areas
-- Labels near pipe stacks
+def extract(dxf_path: str, drawing_scale: float = 100.0) -> dict:
+    """
+    Extract quantities from DXF file.
+    drawing_scale: 1 drawing unit = 1/scale meters (default 1:100 → 1 unit = 0.01 m)
+    Returns dict with 'blocks', 'pipes', 'metadata'.
+    """
+    doc = ezdxf.readfile(dxf_path)
+    msp = doc.modelspace()
 
-For EACH shaft found:
-1. Read the exact SH number (SH12, SH13, SH14, etc.)
-2. Look at nearby fixtures - count WC (toilet pan), wash basin, floor drain
-3. Note bathroom type
+    block_counts  = Counter()     # block_name → count
+    pipe_lengths  = defaultdict(float)  # layer_name → total length
 
-{f"Project context: {project_context}" if project_context else ""}
+    PIPE_LAYER_RE = re.compile(r"PIPE|DRAIN|STACK|VENT|SUPPLY|SOIL", re.I)
 
-Return ONLY valid JSON - no extra text:
-{{
-  "drawing_type": "Typical Floor Plan",
-  "total_shafts": 0,
-  "shafts": [
-    {{
-      "id": "SH-12",
-      "bathroom_type": "Standard Toilet",
-      "fixtures": {{
-        "WC": 1,
-        "Wash Basin": 1,
-        "Floor Drain": 1,
-        "Kitchen Sink": 0,
-        "Shower": 0
-      }},
-      "notes": ""
-    }}
-  ],
-  "observations": "Brief description of drawing",
-  "confidence": "High"
-}}"""
+    for entity in msp:
+        etype = entity.dxftype()
 
-        response = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "Content-Type": "application/json",
-                "x-api-key": api_key,
-                "anthropic-version": "2023-06-01"
-            },
-            json={
-                "model": "claude-opus-4-5",
-                "max_tokens": 2000,
-                "messages": [{
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": "image/png",
-                                "data": image_b64
-                            }
-                        },
-                        {"type": "text", "text": prompt}
-                    ]
-                }]
-            },
-            timeout=60
-        )
-        
-        if response.status_code == 200:
-            data = response.json()
-            text = data['content'][0]['text']
-            text = re.sub(r'```json|```', '', text).strip()
-            return json.loads(text)
-        else:
-            err = response.json()
-            st.error(f"API Error {response.status_code}: {err.get('error', {}).get('message', 'Unknown')}")
-            return None
-    except Exception as e:
-        st.error(f"AI Analysis error: {str(e)}")
-        return None
+        if etype == "INSERT":
+            block_counts[entity.dxf.name] += 1
 
-def generate_boq_excel(sh_data, project_name="Huliot Project"):
-    """Generate complete BOQ Excel from shaft data"""
-    
-    # Material database per fixture unit
-    materials = [
-        # 110mm WC system
-        {'fixture': 'WC', 'desc': 'Huliot DIA.110mm L-3000mm Single Socket Pipe', 'unit': 'MTR', 'qty_per': 14.15, 'sku': '5751100300-i', 'price': 2461},
-        {'fixture': 'WC', 'desc': 'Huliot DIA.110mm L-500mm Single Socket Pipe', 'unit': 'NOS.', 'qty_per': 2, 'sku': '5751100050-i', 'price': 452},
-        {'fixture': 'WC', 'desc': 'Huliot DIA.110mm Socket', 'unit': 'NOS.', 'qty_per': 22, 'sku': '7071740275', 'price': 533},
-        {'fixture': 'WC', 'desc': 'Huliot DIA.110mm 90 Bend', 'unit': 'NOS.', 'qty_per': 15, 'sku': '7070040870-i', 'price': 581},
-        {'fixture': 'WC', 'desc': 'Huliot DIA.110mm 45 Bend', 'unit': 'NOS.', 'qty_per': 11, 'sku': '7070040470-i', 'price': 534},
-        {'fixture': 'WC', 'desc': 'Huliot DIA.110mm Equal Tee', 'unit': 'NOS.', 'qty_per': 4, 'sku': '7071740675-i', 'price': 727},
-        {'fixture': 'WC', 'desc': 'Huliot Dia.110mm Clamps (Fixed)', 'unit': 'NOS.', 'qty_per': 12, 'sku': '8011100', 'price': 234},
-        {'fixture': 'WC', 'desc': 'Huliot Dia.110mm Clamps (Sliding)', 'unit': 'NOS.', 'qty_per': 6, 'sku': '8011101', 'price': 218},
-        # 50mm Basin system
-        {'fixture': 'Wash Basin', 'desc': 'Huliot DIA.50mm L-1000mm Single Socket Pipe', 'unit': 'MTR', 'qty_per': 5.8, 'sku': '5755000100-i', 'price': 390},
-        {'fixture': 'Wash Basin', 'desc': 'Huliot DIA.50mm Socket', 'unit': 'NOS.', 'qty_per': 3, 'sku': '7071720275', 'price': 162},
-        {'fixture': 'Wash Basin', 'desc': 'Huliot DIA.50mm 90 Bend', 'unit': 'NOS.', 'qty_per': 10, 'sku': '7070020870-i', 'price': 119},
-        {'fixture': 'Wash Basin', 'desc': 'Huliot DIA.50mm 45 Bend', 'unit': 'NOS.', 'qty_per': 2, 'sku': '7070020470-i', 'price': 97},
-        {'fixture': 'Wash Basin', 'desc': 'Huliot Dia.50mm Clamps (Fixed)', 'unit': 'NOS.', 'qty_per': 5, 'sku': '8010500', 'price': 118},
-        {'fixture': 'Wash Basin', 'desc': 'Huliot Dia.50mm Clamps (Sliding)', 'unit': 'NOS.', 'qty_per': 2, 'sku': '8010501', 'price': 104},
-        # 75mm Floor Drain system
-        {'fixture': 'Floor Drain', 'desc': 'Huliot Floor Drain (Multi Floor Trap)', 'unit': 'NOS.', 'qty_per': 1, 'sku': '60117060', 'price': 1247},
-        {'fixture': 'Floor Drain', 'desc': 'Huliot Floor Drain 150mm Height Riser', 'unit': 'NOS.', 'qty_per': 1, 'sku': '69201551 B-i', 'price': 542},
-        {'fixture': 'Floor Drain', 'desc': 'Huliot DIA.75mm L-1000mm Single Socket Pipe', 'unit': 'MTR', 'qty_per': 3.0, 'sku': '5757500100-i', 'price': 620},
-        {'fixture': 'Floor Drain', 'desc': 'Huliot DIA.75mm 90 Bend', 'unit': 'NOS.', 'qty_per': 2, 'sku': '7070030870-i', 'price': 284},
-        # Kitchen Sink
-        {'fixture': 'Kitchen Sink', 'desc': 'Huliot DIA.50mm L-1000mm Single Socket Pipe', 'unit': 'MTR', 'qty_per': 3.5, 'sku': '5755000100-i', 'price': 390},
-        {'fixture': 'Kitchen Sink', 'desc': 'Huliot DIA.50mm 90 Bend', 'unit': 'NOS.', 'qty_per': 4, 'sku': '7070020870-i', 'price': 119},
-        {'fixture': 'Kitchen Sink', 'desc': 'Huliot Dia.50mm Clamps', 'unit': 'NOS.', 'qty_per': 4, 'sku': '8010500', 'price': 118},
-    ]
-    
-    rows = []
+        elif etype in ("LINE", "LWPOLYLINE"):
+            layer = getattr(entity.dxf, "layer", "0")
+            if PIPE_LAYER_RE.search(layer):
+                pipe_lengths[layer] += line_length(entity)
+
+    # Parse block names
+    blocks = []
+    for name, qty in sorted(block_counts.items()):
+        info = parse_block_name(name)
+        info["qty"] = qty
+        blocks.append(info)
+
+    # Convert pipe lengths (drawing units → meters)
+    unit_to_m = 1.0 / drawing_scale
+    pipes = {layer: round(length * unit_to_m, 2)
+             for layer, length in pipe_lengths.items()}
+
+    # Metadata
+    all_layers = [layer.dxf.name for layer in doc.layers]
+    all_block_defs = [b.name for b in doc.blocks if not b.name.startswith("*")]
+
+    return {
+        "blocks":      blocks,
+        "pipes":       pipes,
+        "layers":      all_layers,
+        "block_defs":  all_block_defs,
+        "source_file": os.path.basename(dxf_path),
+        "total_fittings": sum(b["qty"] for b in blocks),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONSOLE PRINT
+# ─────────────────────────────────────────────────────────────────────────────
+
+def print_summary(result: dict):
+    print()
+    print("=" * 60)
+    print(f"  HULIOT QUANTITY TAKEOFF")
+    print(f"  Drawing: {result['source_file']}")
+    print("=" * 60)
+
+    # Group by product line
+    by_product = defaultdict(list)
+    for b in result["blocks"]:
+        by_product[b["product"]].append(b)
+
+    for product, items in sorted(by_product.items()):
+        print(f"\n{product}")
+        print("-" * 40)
+        for item in sorted(items, key=lambda x: (x["type"], x["size"])):
+            print(f"  {item['type']:25s} {item['size']:15s}  x {item['qty']:4d}")
+
+    if result["pipes"]:
+        print(f"\nPIPE RUNS (estimated lengths at 1:{int(1/0.01)} scale)")
+        print("-" * 40)
+        for layer, length_m in sorted(result["pipes"].items()):
+            print(f"  {layer:35s}  {length_m:.1f} m")
+
+    print()
+    print(f"  TOTAL FITTINGS: {result['total_fittings']}")
+    print("=" * 60)
+    print()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EXCEL EXPORT
+# ─────────────────────────────────────────────────────────────────────────────
+
+GREEN_DARK  = "1A5C38"
+GREEN_MID   = "2D8A56"
+GREEN_LIGHT = "C8F0D8"
+GREY_LIGHT  = "F5F5F5"
+
+
+def _border():
+    s = Side(style="thin", color="CCCCCC")
+    return Border(left=s, right=s, top=s, bottom=s)
+
+
+def export_excel(result: dict, out_path: str):
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Quantity Takeoff"
+
+    # --- Title ---
+    ws.merge_cells("A1:H1")
+    ws["A1"] = "HULIOT PIPES & FITTINGS — QUANTITY TAKEOFF"
+    ws["A1"].font      = Font(name="Calibri", bold=True, size=14, color="FFFFFF")
+    ws["A1"].fill      = PatternFill("solid", fgColor=GREEN_DARK)
+    ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 28
+
+    ws.merge_cells("A2:H2")
+    ws["A2"] = f"Source Drawing: {result['source_file']}"
+    ws["A2"].font      = Font(name="Calibri", italic=True, size=10, color=GREEN_DARK)
+    ws["A2"].fill      = PatternFill("solid", fgColor=GREEN_LIGHT)
+    ws["A2"].alignment = Alignment(horizontal="center")
+
+    # --- Header row ---
+    headers = ["Sr.", "Block Name (CAD)", "Product Line", "Type",
+               "Size", "Qty", "Unit", "Remarks"]
+    for col, h in enumerate(headers, 1):
+        cell = ws.cell(row=4, column=col, value=h)
+        cell.font      = Font(name="Calibri", bold=True, size=10, color="FFFFFF")
+        cell.fill      = PatternFill("solid", fgColor=GREEN_MID)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border    = _border()
+    ws.row_dimensions[4].height = 20
+
+    # --- Data rows ---
+    row = 5
     sr = 1
-    
-    for mat in materials:
-        fixture = mat['fixture']
-        row = {
-            'SR. NO.': sr,
-            'DESCRIPTION': mat['desc'],
-            'UNIT': mat['unit'],
-            'SKU': mat['sku'],
-            'Unit Price': mat['price'],
-            'Discount': '35%'
-        }
-        
-        for sh in sh_data:
-            sh_id = sh['sh']
-            count = sh['fixtures'].get(fixture, 0)
-            qty = round(count * mat['qty_per'], 2) if count > 0 else ''
-            row[sh_id] = qty
-        
-        total_qty = sum(
-            sh['fixtures'].get(fixture, 0) * mat['qty_per']
-            for sh in sh_data
-        )
-        row['Total QTY'] = round(total_qty, 2) if total_qty > 0 else 0
-        row['Amount'] = round(total_qty * mat['price'] * 0.65, 2)
-        
-        rows.append(row)
-        sr += 1
-    
-    df = pd.DataFrame(rows)
-    
-    # Write Excel
-    temp_dir = tempfile.gettempdir()
-    out_path = os.path.join(temp_dir, f"{project_name}_BOQ.xlsx")
-    
-    with pd.ExcelWriter(out_path, engine='openpyxl') as writer:
-        df.to_excel(writer, sheet_name='BOQ', index=False)
-        
-        # Summary
-        total = df['Amount'].sum()
-        summary = pd.DataFrame([
-            {'Description': 'Project Name', 'Value': project_name},
-            {'Description': 'Total Shafts', 'Value': len(sh_data)},
-            {'Description': 'Total Line Items', 'Value': len(df)},
-            {'Description': 'Sub Total (ex-tax)', 'Value': round(total, 2)},
-            {'Description': 'GST 18%', 'Value': round(total * 0.18, 2)},
-            {'Description': 'Grand Total', 'Value': round(total * 1.18, 2)},
-        ])
-        summary.to_excel(writer, sheet_name='Summary', index=False)
-        
-        # Shaft summary
-        shaft_summary = pd.DataFrame([
-            {
-                'SH': sh['sh'],
-                'Type': sh.get('type', 'Standard'),
-                'WC': sh['fixtures'].get('WC', 0),
-                'Wash Basin': sh['fixtures'].get('Wash Basin', 0),
-                'Floor Drain': sh['fixtures'].get('Floor Drain', 0),
-                'Kitchen Sink': sh['fixtures'].get('Kitchen Sink', 0),
-            }
-            for sh in sh_data
-        ])
-        shaft_summary.to_excel(writer, sheet_name='Shaft Summary', index=False)
-    
-    return df, out_path
 
-# ─── HERO HEADER ─────────────────────────────────────────────────
-st.markdown("""
-<div class="hero">
-    <h1>HULIOT DIP</h1>
-    <p>DRAWING INTELLIGENCE PLATFORM &nbsp;|&nbsp; DXF VIEWER &nbsp;+&nbsp; AI ANALYSIS &nbsp;+&nbsp; BOQ GENERATOR</p>
-</div>
-""", unsafe_allow_html=True)
+    by_product = defaultdict(list)
+    for b in result["blocks"]:
+        by_product[b["product"]].append(b)
 
-# ─── SIDEBAR ─────────────────────────────────────────────────────
-with st.sidebar:
-    st.markdown('<div class="section-title">PROJECT</div>', unsafe_allow_html=True)
-    
-    project_name = st.text_input("Project Name", "Huliot Project")
-    consultant = st.text_input("Consultant", "")
-    floors = st.number_input("Total Floors", 1, 50, 1)
-    
-    st.markdown("---")
-    st.markdown('<div class="section-title">AI SETTINGS</div>', unsafe_allow_html=True)
-    
-    api_key = st.text_input(
-        "Anthropic API Key",
-        type="password",
-        placeholder="sk-ant-...",
-        help="Get from console.anthropic.com"
-    )
-    if api_key:
-        st.markdown('<span style="color:#00ff88; font-size:0.8rem;">✓ API Key set</span>', unsafe_allow_html=True)
+    for product in sorted(by_product.keys()):
+        items = by_product[product]
+
+        # Product group header
+        ws.merge_cells(f"A{row}:H{row}")
+        ws[f"A{row}"] = f"▶  {product}"
+        ws[f"A{row}"].font      = Font(name="Calibri", bold=True, size=10, color="FFFFFF")
+        ws[f"A{row}"].fill      = PatternFill("solid", fgColor=GREEN_DARK)
+        ws[f"A{row}"].alignment = Alignment(horizontal="left", vertical="center", indent=1)
+        ws.row_dimensions[row].height = 18
+        row += 1
+
+        for item in sorted(items, key=lambda x: (x["type"], x["size"])):
+            fill = PatternFill("solid", fgColor=GREY_LIGHT) if sr % 2 == 0 else PatternFill("solid", fgColor="FFFFFF")
+            values = [sr, item["raw_name"], item["product"],
+                      item["type"], item["size"], item["qty"], "No.", ""]
+            for col, val in enumerate(values, 1):
+                cell = ws.cell(row=row, column=col, value=val)
+                cell.font      = Font(name="Calibri", size=9)
+                cell.fill      = fill
+                cell.border    = _border()
+                cell.alignment = Alignment(horizontal="center" if col in (1, 6) else "left",
+                                           vertical="center")
+            row += 1
+            sr += 1
+
+    # --- Pipe section ---
+    if result["pipes"]:
+        row += 1
+        ws.merge_cells(f"A{row}:H{row}")
+        ws[f"A{row}"] = "▶  PIPE RUNS (estimated lengths)"
+        ws[f"A{row}"].font = Font(name="Calibri", bold=True, size=10, color="FFFFFF")
+        ws[f"A{row}"].fill = PatternFill("solid", fgColor=GREEN_DARK)
+        ws.row_dimensions[row].height = 18
+        row += 1
+
+        for layer, length_m in sorted(result["pipes"].items()):
+            values = [sr, layer, "—", "Pipe Run", "—", length_m, "m", "Estimated"]
+            for col, val in enumerate(values, 1):
+                cell = ws.cell(row=row, column=col, value=val)
+                cell.font   = Font(name="Calibri", size=9)
+                cell.border = _border()
+                cell.alignment = Alignment(horizontal="center" if col in (1, 6) else "left",
+                                           vertical="center")
+            row += 1
+            sr += 1
+
+    # --- Total row ---
+    row += 1
+    ws.merge_cells(f"A{row}:E{row}")
+    ws[f"A{row}"] = "TOTAL FITTINGS"
+    ws[f"A{row}"].font = Font(name="Calibri", bold=True, size=10, color="FFFFFF")
+    ws[f"A{row}"].fill = PatternFill("solid", fgColor=GREEN_MID)
+    ws[f"A{row}"].alignment = Alignment(horizontal="right")
+    ws.cell(row=row, column=6, value=result["total_fittings"]).font = Font(bold=True, size=11)
+
+    # --- Column widths ---
+    widths = [5, 42, 20, 20, 14, 8, 8, 20]
+    for col, w in enumerate(widths, 1):
+        ws.column_dimensions[get_column_letter(col)].width = w
+
+    wb.save(out_path)
+    return out_path
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CSV EXPORT
+# ─────────────────────────────────────────────────────────────────────────────
+
+def export_csv(result: dict, out_path: str):
+    import csv
+    with open(out_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["Block Name", "Product Line", "Type", "Size", "Qty"])
+        for b in result["blocks"]:
+            w.writerow([b["raw_name"], b["product"], b["type"], b["size"], b["qty"]])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENTRY POINT
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: python3 extract_qty.py <path_to.dxf> [drawing_scale]")
+        print("  drawing_scale: denominator only, e.g. 100 for 1:100 (default 100)")
+        sys.exit(1)
+
+    dxf_path = sys.argv[1]
+    scale    = float(sys.argv[2]) if len(sys.argv) > 2 else 100.0
+
+    if not os.path.exists(dxf_path):
+        print(f"ERROR: File not found: {dxf_path}")
+        sys.exit(1)
+
+    ext = Path(dxf_path).suffix.lower()
+    if ext == ".dwg":
+        print()
+        print("ERROR: DWG format cannot be read directly.")
+        print()
+        print("Convert to DXF in AutoCAD:")
+        print("  File → Save As → AutoCAD DXF (*.dxf)")
+        print()
+        print("Or use free ODA File Converter:")
+        print("  https://www.opendesign.com/guestfiles/oda_file_converter")
+        sys.exit(1)
+
+    if ext != ".dxf":
+        print(f"ERROR: Unsupported format '{ext}'. Need .dxf")
+        sys.exit(1)
+
+    print(f"Reading: {dxf_path}")
+    result = extract(dxf_path, scale)
+
+    print_summary(result)
+
+    stem = Path(dxf_path).stem
+    out_dir = Path(dxf_path).parent
+
+    # CSV always
+    csv_path = out_dir / f"blocks_raw_{stem}.csv"
+    export_csv(result, str(csv_path))
+    print(f"CSV saved:   {csv_path}")
+
+    # Excel if openpyxl available
+    if HAS_EXCEL:
+        xl_path = out_dir / f"quantity_takeoff_{stem}.xlsx"
+        export_excel(result, str(xl_path))
+        print(f"Excel saved: {xl_path}")
     else:
-        st.markdown('<span style="color:#ffaa00; font-size:0.8rem;">⚠ Add key for AI analysis</span>', unsafe_allow_html=True)
-    
-    st.markdown("---")
-    st.markdown('<div class="section-title">SETTINGS</div>', unsafe_allow_html=True)
-    
-    detection_radius = st.slider("SH Detection Radius (mm)", 500, 10000, 3000, 500)
-    discount_pct = st.slider("Discount %", 0, 50, 35)
-    include_tax = st.checkbox("Include 18% GST", True)
-    
-    st.markdown("---")
-    st.markdown('<div class="section-title">LEGEND</div>', unsafe_allow_html=True)
-    st.markdown("""
-    <div style="font-family:'IBM Plex Mono',monospace; font-size:0.72rem; color:#8a8a7a; line-height:2;">
-    🔴 WC &nbsp;|&nbsp; 110mm<br>
-    🟡 Basin &nbsp;|&nbsp; 50mm<br>
-    🟢 Floor Drain &nbsp;|&nbsp; 75mm<br>
-    🔵 Kitchen &nbsp;|&nbsp; 50mm
-    </div>
-    """, unsafe_allow_html=True)
+        print("openpyxl not installed — Excel skipped. Install: pip install openpyxl")
 
-# ─── MAIN TABS ───────────────────────────────────────────────────
-tab1, tab2, tab3, tab4 = st.tabs(["📐 VIEWER", "🤖 AI ANALYSIS", "📊 BOQ", "📥 EXPORT"])
+    return result
 
-# ─── TAB 1: VIEWER ───────────────────────────────────────────────
-with tab1:
-    col_upload, col_info = st.columns([3, 1])
-    
-    with col_upload:
-        st.markdown('<div class="section-title">UPLOAD DRAWING</div>', unsafe_allow_html=True)
-        uploaded = st.file_uploader(
-            "Upload DXF File",
-            type=['dxf'],
-            help="Upload DXF file. Export from AutoCAD: File > Save As > AutoCAD 2018 DXF"
-        )
-    
-    if uploaded:
-        # Save file
-        temp_dir = tempfile.gettempdir()
-        dxf_path = os.path.join(temp_dir, uploaded.name)
-        with open(dxf_path, 'wb') as f:
-            f.write(uploaded.getvalue())
-        st.session_state.dxf_path = dxf_path
-        
-        # Get stats
-        with st.spinner("Reading DXF..."):
-            stats, doc = get_dxf_stats(dxf_path)
-        
-        if stats:
-            st.session_state.dxf_doc = doc
-            
-            # Stats row
-            cols = st.columns(5)
-            stat_items = [
-                ("ENTITIES", sum(stats['entities'].values())),
-                ("LAYERS", len(stats['layers'])),
-                ("BLOCKS", len(stats['blocks'])),
-                ("TEXT ITEMS", len(stats['texts'])),
-                ("SH MARKS", len(stats['sh_marks'])),
-            ]
-            for i, (lbl, val) in enumerate(stat_items):
-                with cols[i]:
-                    st.markdown(f"""
-                    <div class="stat-card">
-                        <div class="val">{val}</div>
-                        <div class="lbl">{lbl}</div>
-                    </div>
-                    """, unsafe_allow_html=True)
-            
-            st.markdown("---")
-            
-            # SH marks found
-            if stats['sh_marks']:
-                st.markdown(f'<span class="status-ok">✓ SH MARKS DETECTED: {" | ".join(stats["sh_marks"])}</span>', unsafe_allow_html=True)
-                
-                # Auto-populate sh_data for BOQ
-                if not st.session_state.sh_data:
-                    auto_sh = []
-                    for sh_id in stats['sh_marks']:
-                        auto_sh.append({
-                            'sh': sh_id,
-                            'type': 'Standard Toilet',
-                            'fixtures': {'WC': 1, 'Wash Basin': 1, 'Floor Drain': 1, 'Kitchen Sink': 0}
-                        })
-                    st.session_state.sh_data = auto_sh
-                    st.info(f"✅ {len(auto_sh)} shafts auto-loaded. Go to BOQ tab → adjust fixtures → generate BOQ.")
-            else:
-                st.markdown('<span class="status-warn">⚠ SH blocks found (red circles) but text inside not readable as plain text. Use AI Analysis tab to detect shafts from drawing image.</span>', unsafe_allow_html=True)
-            
-            st.markdown("---")
-            
-            # Render drawing
-            st.markdown('<div class="section-title">DRAWING VIEW</div>', unsafe_allow_html=True)
-            
-            with st.spinner("Rendering drawing..."):
-                img_bytes = render_dxf_to_image(dxf_path)
-            
-            if img_bytes:
-                st.session_state.drawing_image = img_bytes
-                st.image(img_bytes, use_container_width=True, caption=f"{uploaded.name}")
-            else:
-                st.warning("⚠️ Drawing too large/complex to auto-render.")
-                st.markdown("""
-                <div style="background:#1a1200; border:1px solid #ffaa00; border-radius:8px; padding:1rem; margin:1rem 0;">
-                    <b style="color:#ffaa00;">📸 Upload a Screenshot Instead</b><br>
-                    <span style="color:#b0a070; font-size:0.85rem; font-family:'IBM Plex Mono',monospace;">
-                    1. Open DXF in AutoCAD / DWG TrueView<br>
-                    2. Press Print Screen or Snipping Tool<br>
-                    3. Upload screenshot below<br>
-                    4. AI will read SH marks from image
-                    </span>
-                </div>
-                """, unsafe_allow_html=True)
-                
-                screenshot = st.file_uploader(
-                    "Upload Drawing Screenshot",
-                    type=['png', 'jpg', 'jpeg'],
-                    key="screenshot_upload"
-                )
-                if screenshot:
-                    img_bytes = screenshot.getvalue()
-                    st.session_state.drawing_image = img_bytes
-                    st.image(img_bytes, use_container_width=True, caption="Screenshot uploaded")
-                    st.success("✅ Screenshot ready. Go to 🤖 AI ANALYSIS tab.")
-            
-            # Layer info
-            with st.expander("📋 Layers & Blocks"):
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.markdown("**Layers:**")
-                    for layer in stats['layers'][:20]:
-                        st.code(layer, language='')
-                with col2:
-                    st.markdown("**Blocks:**")
-                    for block in stats['blocks'][:20]:
-                        st.code(block, language='')
-        else:
-            st.error("❌ Could not read DXF file. Ensure it's a valid DXF (not DWG).")
-    else:
-        st.markdown("""
-        <div class="upload-zone">
-            <h3 style="color:#1a5f3c; font-family:'Bebas Neue',sans-serif;">UPLOAD DXF TO BEGIN</h3>
-            <p style="color:#8a8a7a; font-family:'IBM Plex Mono',monospace; font-size:0.8rem;">
-            Export from AutoCAD: FILE → SAVE AS → AUTOCAD 2018 DXF
-            </p>
-        </div>
-        """, unsafe_allow_html=True)
 
-# ─── TAB 2: AI ANALYSIS ──────────────────────────────────────────
-with tab2:
-    st.markdown('<div class="section-title">AI DRAWING ANALYSIS</div>', unsafe_allow_html=True)
-    
-    # Allow direct image upload here too
-    ai_image = None
-    
-    if st.session_state.drawing_image:
-        ai_image = st.session_state.drawing_image
-        st.image(ai_image, use_container_width=True, caption="Drawing for AI analysis")
-    else:
-        st.markdown("""
-        <div style="background:#0d1a12; border:1px solid #1a5f3c; border-radius:8px; padding:1.5rem; margin-bottom:1rem;">
-            <b style="color:#00ff88; font-family:'Bebas Neue',sans-serif; font-size:1.3rem;">UPLOAD DRAWING IMAGE DIRECTLY</b><br>
-            <span style="color:#8a8a7a; font-size:0.82rem; font-family:'IBM Plex Mono',monospace;">
-            No DXF needed. Take a screenshot of your drawing and upload here.<br>
-            AI will read SH marks visually from the image.
-            </span>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        direct_img = st.file_uploader(
-            "Upload Drawing Screenshot / Image",
-            type=['png', 'jpg', 'jpeg'],
-            key="ai_direct_image"
-        )
-        if direct_img:
-            ai_image = direct_img.getvalue()
-            st.session_state.drawing_image = ai_image
-            st.image(ai_image, use_container_width=True, caption="Uploaded for AI analysis")
-    
-    if ai_image:
-        context = st.text_input(
-            "Project context (optional)",
-            placeholder="e.g. Residential tower, typical floor, 4 bathrooms per floor"
-        )
-        
-        col1, col2 = st.columns([2, 1])
-        with col1:
-            analyze_btn = st.button("🤖 Analyze Drawing with AI", type="primary", use_container_width=True)
-        with col2:
-            manual_btn = st.button("✏️ Enter Shafts Manually", use_container_width=True)
-        
-        if analyze_btn:
-            if not api_key:
-                st.error("❌ Add your Anthropic API key in the sidebar first.")
-                st.info("Get free API key at: https://console.anthropic.com")
-            else:
-                with st.spinner("AI reading SH marks from drawing image... (30-60 sec)"):
-                    result = analyze_drawing_with_ai(ai_image, api_key, context)
-            
-            if result:
-                st.session_state.analysis_done = True
-                
-                st.markdown(f"""
-                <div style="background:#0d1a12; border:1px solid #1a5f3c; border-radius:8px; padding:1rem; margin:1rem 0;">
-                    <span style="color:#8a8a7a; font-family:'IBM Plex Mono',monospace; font-size:0.8rem;">
-                    DRAWING TYPE: <b style="color:#00ff88">{result.get('drawing_type','Unknown')}</b> &nbsp;|&nbsp;
-                    CONFIDENCE: <b style="color:#00ff88">{result.get('confidence','Medium')}</b> &nbsp;|&nbsp;
-                    SHAFTS: <b style="color:#00ff88">{result.get('total_shafts', len(result.get('shafts',[])))}</b>
-                    </span>
-                </div>
-                """, unsafe_allow_html=True)
-                
-                if result.get('observations'):
-                    st.markdown(f"**Observations:** {result['observations']}")
-                
-                # Build SH data for BOQ
-                sh_data = []
-                for shaft in result.get('shafts', []):
-                    sh_data.append({
-                        'sh': shaft['id'],
-                        'type': shaft.get('bathroom_type', 'Standard'),
-                        'fixtures': shaft.get('fixtures', {'WC': 1, 'Wash Basin': 1, 'Floor Drain': 1}),
-                        'notes': shaft.get('notes', '')
-                    })
-                
-                st.session_state.sh_data = sh_data
-                
-                # Show shaft cards
-                st.markdown('<div class="section-title">DETECTED SHAFTS</div>', unsafe_allow_html=True)
-                
-                for sh in sh_data:
-                    fix = sh['fixtures']
-                    st.markdown(f"""
-                    <div class="sh-card">
-                        <div class="sh-label">{sh['sh']}</div>
-                        <div class="sh-type">{sh['type']}</div>
-                        <div class="fixture-row">
-                            <span class="fix-item">🔴 WC: {fix.get('WC',0)}</span>
-                            <span class="fix-item">🟡 BASIN: {fix.get('Wash Basin',0)}</span>
-                            <span class="fix-item">🟢 DRAIN: {fix.get('Floor Drain',0)}</span>
-                            <span class="fix-item">🔵 KIT: {fix.get('Kitchen Sink',0)}</span>
-                        </div>
-                        {f'<div style="font-size:0.72rem; color:#8a8a7a; margin-top:0.5rem;">{sh["notes"]}</div>' if sh.get('notes') else ''}
-                    </div>
-                    """, unsafe_allow_html=True)
-            else:
-                st.error("AI analysis failed. Use manual entry.")
-        
-        if manual_btn or (not st.session_state.analysis_done and not analyze_btn):
-            st.markdown('<div class="section-title">MANUAL SHAFT ENTRY</div>', unsafe_allow_html=True)
-            
-            num_shafts = st.number_input("Number of Shafts (Bathrooms)", 1, 50, 4)
-            
-            sh_data_manual = []
-            
-            for i in range(int(num_shafts)):
-                with st.expander(f"SH-{str(i+1).zfill(2)}", expanded=i < 3):
-                    col1, col2, col3, col4, col5 = st.columns(5)
-                    
-                    sh_id = col1.text_input("SH ID", f"SH-{str(i+1).zfill(2)}", key=f"sh_id_{i}")
-                    wc = col2.number_input("WC", 0, 10, 1, key=f"wc_{i}")
-                    basin = col3.number_input("Basin", 0, 10, 1, key=f"basin_{i}")
-                    drain = col4.number_input("FD", 0, 10, 1, key=f"drain_{i}")
-                    kitchen = col5.number_input("KIT", 0, 10, 0, key=f"kit_{i}")
-                    
-                    sh_data_manual.append({
-                        'sh': sh_id,
-                        'type': 'Standard',
-                        'fixtures': {
-                            'WC': wc,
-                            'Wash Basin': basin,
-                            'Floor Drain': drain,
-                            'Kitchen Sink': kitchen
-                        }
-                    })
-            
-            if st.button("✅ Confirm Shafts", type="primary", use_container_width=True):
-                st.session_state.sh_data = sh_data_manual
-                st.success(f"✅ {num_shafts} shafts configured")
-
-# ─── TAB 3: BOQ ──────────────────────────────────────────────────
-with tab3:
-    st.markdown('<div class="section-title">BILL OF QUANTITIES</div>', unsafe_allow_html=True)
-    
-    if not st.session_state.sh_data:
-        st.info("Complete AI Analysis or enter shafts manually first.")
-    else:
-        # Summary cards
-        sh_data = st.session_state.sh_data
-        
-        col1, col2, col3, col4 = st.columns(4)
-        
-        total_wc = sum(s['fixtures'].get('WC', 0) for s in sh_data)
-        total_basin = sum(s['fixtures'].get('Wash Basin', 0) for s in sh_data)
-        total_drain = sum(s['fixtures'].get('Floor Drain', 0) for s in sh_data)
-        
-        metrics = [
-            ("SHAFTS", len(sh_data)),
-            ("TOTAL WC", total_wc),
-            ("TOTAL BASINS", total_basin),
-            ("TOTAL DRAINS", total_drain)
-        ]
-        
-        for col, (lbl, val) in zip([col1, col2, col3, col4], metrics):
-            with col:
-                st.markdown(f"""
-                <div class="stat-card">
-                    <div class="val">{val}</div>
-                    <div class="lbl">{lbl}</div>
-                </div>
-                """, unsafe_allow_html=True)
-        
-        st.markdown("---")
-        
-        # Generate BOQ
-        if st.button("📊 Generate BOQ", type="primary", use_container_width=True):
-            with st.spinner("Generating BOQ..."):
-                df, boq_path = generate_boq_excel(sh_data, project_name)
-            
-            st.session_state.boq_df = df
-            st.session_state.boq_path = boq_path
-            
-            total_amount = df['Amount'].sum()
-            
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.markdown(f"""<div class="stat-card">
-                    <div class="val">{len(df)}</div>
-                    <div class="lbl">LINE ITEMS</div>
-                </div>""", unsafe_allow_html=True)
-            with col2:
-                st.markdown(f"""<div class="stat-card">
-                    <div class="val">₹{total_amount/100000:.1f}L</div>
-                    <div class="lbl">SUB TOTAL</div>
-                </div>""", unsafe_allow_html=True)
-            with col3:
-                st.markdown(f"""<div class="stat-card">
-                    <div class="val">₹{total_amount*1.18/100000:.1f}L</div>
-                    <div class="lbl">GRAND TOTAL</div>
-                </div>""", unsafe_allow_html=True)
-            
-            st.markdown("---")
-            st.markdown('<div class="section-title">BOQ PREVIEW</div>', unsafe_allow_html=True)
-            st.dataframe(df, use_container_width=True, height=400)
-
-# ─── TAB 4: EXPORT ───────────────────────────────────────────────
-with tab4:
-    st.markdown('<div class="section-title">EXPORT FILES</div>', unsafe_allow_html=True)
-    
-    if st.session_state.boq_df is None:
-        st.info("Generate BOQ in the BOQ tab first.")
-    else:
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.markdown("### 📊 BOQ Excel")
-            st.markdown(f"""
-            <div class="sh-card">
-                <div style="font-family:'IBM Plex Mono',monospace; font-size:0.8rem; color:#b0c0b0;">
-                    <b>Project:</b> {project_name}<br>
-                    <b>Shafts:</b> {len(st.session_state.sh_data)}<br>
-                    <b>Items:</b> {len(st.session_state.boq_df)}<br>
-                    <b>Sheets:</b> BOQ / Summary / Shaft Summary
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
-            
-            with open(st.session_state.boq_path, 'rb') as f:
-                st.download_button(
-                    "⬇️ Download BOQ Excel",
-                    f.read(),
-                    file_name=f"{project_name}_BOQ.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True
-                )
-        
-        with col2:
-            st.markdown("### 📐 Marked DXF")
-            st.markdown(f"""
-            <div class="sh-card">
-                <div style="font-family:'IBM Plex Mono',monospace; font-size:0.8rem; color:#b0c0b0;">
-                    Original DXF with SH labels added<br>
-                    (if DXF was uploaded)
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
-            
-            if st.session_state.dxf_path:
-                with open(st.session_state.dxf_path, 'rb') as f:
-                    st.download_button(
-                        "⬇️ Download DXF",
-                        f.read(),
-                        file_name=f"{project_name}_marked.dxf",
-                        mime="application/dxf",
-                        use_container_width=True
-                    )
-
-# ─── FOOTER ──────────────────────────────────────────────────────
-st.markdown("---")
-st.markdown("""
-<div style="text-align:center; padding:1rem 0; font-family:'IBM Plex Mono',monospace; font-size:0.72rem; color:#8a8a7a;">
-    HULIOT DRAWING INTELLIGENCE PLATFORM v3.0 &nbsp;|&nbsp; 
-    AI-POWERED PLUMBING BOQ &nbsp;|&nbsp; 
-    HULIOT PIPES & FITTINGS PVT. LTD.
-</div>
-""", unsafe_allow_html=True)
+if __name__ == "__main__":
+    main()
